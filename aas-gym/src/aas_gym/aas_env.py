@@ -406,3 +406,443 @@ class AASEnv(gym.Env):
             self.socket.close(linger=0)
         if self.zmq_context:
             self.zmq_context.term()
+
+
+class AASVelocityEnv(AASEnv):
+    """
+    Aerial Autonomy Stack Gym Environment with Velocity Control.
+
+    This environment extends AASEnv to provide:
+    - Action Space: Velocity commands [vx, vy, vz, yaw_rate] in m/s and rad/s
+    - Observation Space: Drone state [x, y, z, vx, vy, vz, qw, qx, qy, qz]
+
+    The environment communicates with:
+    1. Simulation container (via ZMQ) for world stepping
+    2. Aircraft container (via ZMQ) for velocity control and state feedback
+
+    Coordinate Frame:
+    - ArduPilot: ENU (East-North-Up) - vx=East, vy=North, vz=Up
+    - PX4: NED (North-East-Down) - vx=North, vy=East, vz=Down (handled internally)
+    """
+
+    # ZMQ message format constants for aircraft control
+    ACTION_FORMAT = '4d'  # 4 doubles: vx, vy, vz, yaw_rate
+    ACTION_SIZE = struct.calcsize(ACTION_FORMAT)
+    STATE_FORMAT = '10d'  # 10 doubles: x, y, z, vx, vy, vz, qw, qx, qy, qz
+    STATE_SIZE = struct.calcsize(STATE_FORMAT)
+
+    def __init__(self,
+            instance: int = 0,
+            gym_freq_hz: int = 50,
+            autopilot: str = "ardupilot",  # Default to ArduPilot for velocity control
+            camera: bool = False,  # Disable camera by default for faster training
+            lidar: bool = False,   # Disable lidar by default for faster training
+            num_quads: int = 1,
+            render_mode = None,
+            max_velocity: float = 10.0,  # Maximum velocity in m/s
+            max_yaw_rate: float = 1.0,   # Maximum yaw rate in rad/s
+            target_position: np.ndarray = None,  # Optional target for reward calculation
+        ):
+        """
+        Initialize the velocity-controlled drone environment.
+
+        Args:
+            instance: Environment instance ID (for parallel environments)
+            gym_freq_hz: Control frequency in Hz
+            autopilot: Autopilot type ("ardupilot" or "px4")
+            camera: Enable camera sensor
+            lidar: Enable lidar sensor
+            num_quads: Number of quadcopter drones
+            render_mode: Rendering mode ("human", "ansi", or None)
+            max_velocity: Maximum velocity command magnitude in m/s
+            max_yaw_rate: Maximum yaw rate command in rad/s
+            target_position: Optional target position [x, y, z] for reward calculation
+        """
+        # Initialize parent class (handles Docker, networks, simulation ZMQ)
+        super().__init__(
+            instance=instance,
+            gym_freq_hz=gym_freq_hz,
+            autopilot=autopilot,
+            camera=camera,
+            lidar=lidar,
+            num_quads=num_quads,
+            render_mode=render_mode
+        )
+
+        self.max_velocity = max_velocity
+        self.max_yaw_rate = max_yaw_rate
+        self.target_position = target_position if target_position is not None else np.array([100.0, 0.0, -50.0])
+
+        # Override Action Space: [vx, vy, vz, yaw_rate] normalized to [-1, 1]
+        self.action_space = gym.spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(4,),
+            dtype=np.float32
+        )
+
+        # Override Observation Space: [x, y, z, vx, vy, vz, qw, qx, qy, qz]
+        # Position bounds are large to accommodate flight area
+        # Velocity bounds match max_velocity
+        # Quaternion components are bounded [-1, 1]
+        obs_low = np.array([
+            -1000.0, -1000.0, -1000.0,  # Position (m)
+            -max_velocity, -max_velocity, -max_velocity,  # Velocity (m/s)
+            -1.0, -1.0, -1.0, -1.0  # Quaternion
+        ], dtype=np.float64)
+        obs_high = np.array([
+            1000.0, 1000.0, 1000.0,  # Position (m)
+            max_velocity, max_velocity, max_velocity,  # Velocity (m/s)
+            1.0, 1.0, 1.0, 1.0  # Quaternion
+        ], dtype=np.float64)
+        self.observation_space = gym.spaces.Box(
+            low=obs_low,
+            high=obs_high,
+            dtype=np.float64
+        )
+
+        # Drone state storage
+        self.drone_position = np.zeros(3)
+        self.drone_velocity = np.zeros(3)
+        self.drone_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion
+
+        # Aircraft ZMQ setup (separate from simulation ZMQ)
+        self.aircraft_zmq_port = 5556  # Port for gym_control_node.py
+        self.aircraft_socket = None
+
+    def _get_obs(self):
+        """Get current observation (drone state)."""
+        return np.concatenate([
+            self.drone_position,
+            self.drone_velocity,
+            self.drone_orientation
+        ]).astype(np.float64)
+
+    def _get_info(self):
+        """Get additional info dict."""
+        return {
+            "sim_time_sec": self.sim_sec,
+            "sim_time_nanosec": self.sim_nanosec,
+            "position": self.drone_position.copy(),
+            "velocity": self.drone_velocity.copy(),
+            "orientation": self.drone_orientation.copy(),
+            "distance_to_target": np.linalg.norm(self.drone_position - self.target_position)
+        }
+
+    def _connect_aircraft_zmq(self):
+        """Connect to aircraft container ZMQ socket."""
+        if self.aircraft_socket is not None:
+            try:
+                self.aircraft_socket.close()
+            except Exception:
+                pass
+
+        self.aircraft_socket = self.zmq_context.socket(zmq.REQ)
+        self.aircraft_socket.setsockopt(zmq.RCVTIMEO, 10 * 1000)  # 10 second timeout
+        self.aircraft_socket.setsockopt(zmq.SNDTIMEO, 10 * 1000)
+
+        # Connect to first aircraft container
+        # Aircraft IP is at SIM_SUBNET.90.1 (drone ID 1)
+        aircraft_ip = f"{self.SIM_SUBNET}.90.1"
+        self.aircraft_socket.connect(f"tcp://{aircraft_ip}:{self.aircraft_zmq_port}")
+        print(f"Aircraft ZMQ socket connected to {aircraft_ip}:{self.aircraft_zmq_port}")
+
+    def _send_velocity_command(self, vx: float, vy: float, vz: float, yaw_rate: float) -> bool:
+        """
+        Send velocity command to aircraft and receive state.
+
+        Args:
+            vx, vy, vz: Velocity commands in m/s
+            yaw_rate: Yaw rate command in rad/s
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Pack and send action
+            action_payload = struct.pack(self.ACTION_FORMAT, vx, vy, vz, yaw_rate)
+            self.aircraft_socket.send(action_payload)
+
+            # Receive state
+            reply_bytes = self.aircraft_socket.recv()
+
+            if len(reply_bytes) == self.STATE_SIZE:
+                state = struct.unpack(self.STATE_FORMAT, reply_bytes)
+                self.drone_position = np.array(state[0:3])
+                self.drone_velocity = np.array(state[3:6])
+                self.drone_orientation = np.array(state[6:10])
+                return True
+            else:
+                print(f"Warning: Invalid state size received: {len(reply_bytes)}")
+                return False
+
+        except zmq.error.Again:
+            print("Aircraft ZMQ Error: Timeout waiting for state")
+            return False
+        except struct.error as e:
+            print(f"Aircraft ZMQ Error: Struct error: {e}")
+            return False
+        except Exception as e:
+            print(f"Aircraft ZMQ Error: {e}")
+            return False
+
+    def reset(self, seed=None, options=None):
+        """Reset the environment."""
+        # Call parent reset (handles simulation reset and container restart)
+        obs, info = super().reset(seed=seed, options=options)
+
+        # Wait a bit for aircraft container to fully initialize
+        time.sleep(2.0)
+
+        # Connect to aircraft ZMQ
+        self._connect_aircraft_zmq()
+
+        # Wait for gym_control_node to be ready and get initial state
+        max_retries = 30
+        for i in range(max_retries):
+            try:
+                # Send a "get state" request (zero velocity)
+                if self._send_velocity_command(0.0, 0.0, 0.0, 0.0):
+                    print(f"Aircraft ZMQ connected. Initial position: {self.drone_position}")
+                    break
+            except Exception as e:
+                if i < max_retries - 1:
+                    print(f"Waiting for aircraft ZMQ... ({i+1}/{max_retries})")
+                    time.sleep(1.0)
+                else:
+                    print(f"Warning: Could not connect to aircraft ZMQ after {max_retries} retries")
+
+        return self._get_obs(), self._get_info()
+
+    def step(self, action):
+        """
+        Execute one environment step.
+
+        Args:
+            action: Normalized velocity command [vx, vy, vz, yaw_rate] in [-1, 1]
+
+        Returns:
+            observation, reward, terminated, truncated, info
+        """
+        # Scale action from [-1, 1] to actual velocity
+        vx = float(action[0]) * self.max_velocity
+        vy = float(action[1]) * self.max_velocity
+        vz = float(action[2]) * self.max_velocity
+        yaw_rate = float(action[3]) * self.max_yaw_rate
+
+        # Step simulation (parent class handles this)
+        # Send dummy action to simulation to advance time
+        try:
+            action_payload = struct.pack('d', 0.0)  # Dummy action for simulation stepping
+            self.socket.send(action_payload)
+            reply_bytes = self.socket.recv()
+            unpacked = struct.unpack('iI', reply_bytes)
+            self.sim_sec, self.sim_nanosec = unpacked
+        except zmq.error.Again:
+            print("Simulation ZMQ Error: Reply from container timed out.")
+        except Exception as e:
+            print(f"Simulation ZMQ Error: {e}")
+
+        # Send velocity command to aircraft and get state
+        self._send_velocity_command(vx, vy, vz, yaw_rate)
+
+        self.step_count += 1
+
+        # Calculate reward (customize this for your task)
+        reward = self._calculate_reward(action)
+
+        # Check termination conditions
+        terminated = self._check_terminated()
+        truncated = self.step_count >= self.max_steps
+
+        # Get observation and info
+        obs = self._get_obs()
+        info = self._get_info()
+
+        # Handle rendering
+        if self.render_mode == "ansi":
+            self._render_frame()
+
+        return obs, reward, terminated, truncated, info
+
+    def _calculate_reward(self, action) -> float:
+        """
+        Calculate reward for the current step.
+
+        Default implementation: negative distance to target + velocity bonus toward target.
+        Override this method to implement custom reward functions.
+
+        Args:
+            action: The action taken
+
+        Returns:
+            Reward value
+        """
+        # Distance to target
+        distance = np.linalg.norm(self.drone_position - self.target_position)
+
+        # Direction to target
+        direction_to_target = self.target_position - self.drone_position
+        direction_norm = np.linalg.norm(direction_to_target)
+        if direction_norm > 0.1:
+            direction_to_target = direction_to_target / direction_norm
+        else:
+            direction_to_target = np.zeros(3)
+
+        # Velocity toward target (dot product)
+        velocity_toward_target = np.dot(self.drone_velocity, direction_to_target)
+
+        # Reward components
+        distance_reward = -0.01 * distance  # Penalize distance
+        velocity_reward = 0.1 * velocity_toward_target  # Reward moving toward target
+
+        # Action smoothness penalty (penalize large actions)
+        action_penalty = -0.01 * np.sum(np.square(action))
+
+        # Goal bonus
+        goal_bonus = 10.0 if distance < 5.0 else 0.0
+
+        reward = distance_reward + velocity_reward + action_penalty + goal_bonus
+
+        return float(reward)
+
+    def _check_terminated(self) -> bool:
+        """
+        Check if episode should terminate.
+
+        Default: terminate if drone goes out of bounds or crashes.
+        Override this method to implement custom termination conditions.
+
+        Returns:
+            True if episode should terminate
+        """
+        # Check position bounds
+        if np.any(np.abs(self.drone_position) > 500.0):
+            print("Episode terminated: Out of bounds")
+            return True
+
+        # Check if crashed (z too low for NED, too high for ENU)
+        # This depends on coordinate frame - adjust as needed
+        if self.AUTOPILOT == "ardupilot":
+            # ENU: z is up, crash if z < 0 (below ground)
+            if self.drone_position[2] < 0.5:
+                print("Episode terminated: Crashed (z < 0.5)")
+                return True
+        else:
+            # NED: z is down, crash if z > -0.5 (too close to ground)
+            if self.drone_position[2] > -0.5:
+                print("Episode terminated: Crashed (z > -0.5)")
+                return True
+
+        # Check if reached target
+        distance = np.linalg.norm(self.drone_position - self.target_position)
+        if distance < 2.0:
+            print("Episode terminated: Reached target!")
+            return True
+
+        return False
+
+    def close(self):
+        """Clean up resources."""
+        # Close aircraft ZMQ
+        if self.aircraft_socket is not None:
+            try:
+                self.aircraft_socket.close(linger=0)
+            except Exception:
+                pass
+
+        # Call parent close
+        super().close()
+
+
+class AASForwardFlightEnv(AASVelocityEnv):
+    """
+    Simplified environment for learning forward flight.
+
+    This environment rewards the drone for moving forward (positive x direction)
+    while maintaining altitude and orientation.
+
+    Action Space: [forward_velocity, lateral_velocity, vertical_velocity, yaw_rate]
+    Observation Space: [x, y, z, vx, vy, vz, qw, qx, qy, qz]
+    """
+
+    def __init__(self, **kwargs):
+        # Set defaults for forward flight training
+        kwargs.setdefault('autopilot', 'ardupilot')
+        kwargs.setdefault('max_velocity', 5.0)  # Lower max velocity for stability
+        kwargs.setdefault('max_yaw_rate', 0.5)
+        kwargs.setdefault('camera', False)
+        kwargs.setdefault('lidar', False)
+
+        super().__init__(**kwargs)
+
+        # Target altitude (ENU frame, z is up)
+        self.target_altitude = 40.0  # meters
+        self.initial_position = None
+
+    def reset(self, seed=None, options=None):
+        """Reset and record initial position."""
+        obs, info = super().reset(seed=seed, options=options)
+        self.initial_position = self.drone_position.copy()
+        return obs, info
+
+    def _calculate_reward(self, action) -> float:
+        """
+        Reward function for forward flight.
+
+        Rewards:
+        - Forward velocity (positive x)
+        - Maintaining target altitude
+        - Staying close to initial y position (no drift)
+        - Smooth actions
+        """
+        # Forward progress reward
+        forward_velocity = self.drone_velocity[0]  # vx in ENU
+        forward_reward = 0.5 * forward_velocity  # Reward forward motion
+
+        # Altitude maintenance reward (ENU: z is up)
+        altitude_error = abs(self.drone_position[2] - self.target_altitude)
+        altitude_reward = -0.1 * altitude_error
+
+        # Lateral drift penalty
+        if self.initial_position is not None:
+            lateral_drift = abs(self.drone_position[1] - self.initial_position[1])
+            drift_penalty = -0.05 * lateral_drift
+        else:
+            drift_penalty = 0.0
+
+        # Action smoothness penalty
+        action_penalty = -0.01 * np.sum(np.square(action))
+
+        # Survival bonus (small positive reward for staying alive)
+        survival_bonus = 0.1
+
+        reward = forward_reward + altitude_reward + drift_penalty + action_penalty + survival_bonus
+
+        return float(reward)
+
+    def _check_terminated(self) -> bool:
+        """Check termination for forward flight."""
+        # Check altitude bounds (ENU)
+        if self.drone_position[2] < 5.0:  # Too low
+            print("Episode terminated: Too low")
+            return True
+        if self.drone_position[2] > 100.0:  # Too high
+            print("Episode terminated: Too high")
+            return True
+
+        # Check lateral drift
+        if self.initial_position is not None:
+            lateral_drift = abs(self.drone_position[1] - self.initial_position[1])
+            if lateral_drift > 50.0:
+                print("Episode terminated: Too much lateral drift")
+                return True
+
+        # Check if drone has traveled far enough (success condition)
+        if self.initial_position is not None:
+            forward_distance = self.drone_position[0] - self.initial_position[0]
+            if forward_distance > 200.0:
+                print("Episode terminated: Reached forward distance goal!")
+                return True
+
+        return False

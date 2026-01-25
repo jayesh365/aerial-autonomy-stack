@@ -90,4 +90,5 @@ windows:
       layout: even-horizontal
       panes:
         - python3 /aas/aircraft_resources/scripts/gymnasium_setup.py --drone_id <%= drone_id %> <%= simulated_time ? '--ros-args -p use_sim_time:=true' : '' %>
+        - sleep 60 && python3 /aas/aircraft_resources/scripts/gym_control_node.py --drone_id <%= drone_id %> --autopilot <%= autopilot %> --zmq_port 5556 <%= simulated_time ? '--ros-args -p use_sim_time:=true' : '' %>
   <% end %>

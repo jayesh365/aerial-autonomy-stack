@@ -10,23 +10,38 @@ from gymnasium.utils.env_checker import check_env
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env as sb3_check_env
 
-from aas_gym.aas_env import AASEnv
+from aas_gym.aas_env import AASEnv, AASVelocityEnv, AASForwardFlightEnv
 
 
-# Register the environment so we can create it with gym.make()
+# Register the environments so we can create them with gym.make()
 gym.register(
     id="AASEnv-v0",
     entry_point=AASEnv,
 )
 
+gym.register(
+    id="AASVelocityEnv-v0",
+    entry_point=AASVelocityEnv,
+)
+
+gym.register(
+    id="AASForwardFlightEnv-v0",
+    entry_point=AASForwardFlightEnv,
+)
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, default="step", choices=["step", "speedup", "vectorenv-speedup", "learn"])
+    parser.add_argument("--mode", type=str, default="step", choices=[
+        "step", "speedup", "vectorenv-speedup", "learn",
+        "velocity-step", "velocity-train", "forward-flight"
+    ])
     parser.add_argument("--repetitions", type=int, default=1),
-    parser.add_argument("--autopilot", type=str, default="px4", choices=["px4", "ardupilot"])
-    parser.add_argument("--camera", action=argparse.BooleanOptionalAction, default=True, help="Enable/Disable Camera")
-    parser.add_argument("--lidar", action=argparse.BooleanOptionalAction, default=True, help="Enable/Disable Lidar")
+    parser.add_argument("--autopilot", type=str, default="ardupilot", choices=["px4", "ardupilot"])
+    parser.add_argument("--camera", action=argparse.BooleanOptionalAction, default=False, help="Enable/Disable Camera")
+    parser.add_argument("--lidar", action=argparse.BooleanOptionalAction, default=False, help="Enable/Disable Lidar")
     parser.add_argument("--num_quads", type=int, default=1)
+    parser.add_argument("--max_velocity", type=float, default=5.0, help="Maximum velocity in m/s")
+    parser.add_argument("--timesteps", type=int, default=50000, help="Total timesteps for training")
     args = parser.parse_args()
 
     if args.mode == "step":
@@ -179,12 +194,243 @@ def main():
         # for _ in range(800): # Run for 800 steps
         #     action, _states = model.predict(obs, deterministic=True)
         #     obs, reward, terminated, truncated, info = env.step(action)
-            
+
         #     if terminated or truncated:
         #         print("Episode finished. Resetting.")
         #         obs, info = env.reset()
-        
+
         # env.close()
+
+    elif args.mode == "velocity-step":
+        """Manual stepping with velocity control - useful for testing."""
+        print("=== Velocity Control Manual Stepping Mode ===")
+        print(f"Autopilot: {args.autopilot}, Max Velocity: {args.max_velocity} m/s")
+
+        env = gym.make(
+            "AASVelocityEnv-v0",
+            gym_freq_hz=10,  # Lower frequency for manual control
+            autopilot=args.autopilot,
+            camera=args.camera,
+            lidar=args.lidar,
+            num_quads=args.num_quads,
+            max_velocity=args.max_velocity,
+            render_mode="human"
+        )
+
+        obs, info = env.reset()
+        print(f"\nReset complete!")
+        print(f"Initial position: {info['position']}")
+        print(f"Observation space: {env.observation_space}")
+        print(f"Action space: {env.action_space}")
+
+        print("\n--- Controls ---")
+        print("Enter velocity commands as: vx vy vz yaw_rate (normalized -1 to 1)")
+        print("Examples:")
+        print("  '0.5 0 0 0' - Move forward at 50% max velocity")
+        print("  '0 0.3 0 0' - Move right at 30% max velocity")
+        print("  '0 0 0.2 0' - Move up at 20% max velocity")
+        print("  'r' - Reset environment")
+        print("  'q' - Quit")
+        print("  '' (empty) - Random action")
+
+        for i in itertools.count():
+            user_input = input("\nAction [vx vy vz yaw] or r/q: ").strip().lower()
+
+            if user_input in ('q', 'quit'):
+                break
+            elif user_input in ('r', 'reset'):
+                obs, info = env.reset()
+                print(f"Reset! Position: {info['position']}")
+                continue
+            elif user_input == '':
+                action = env.action_space.sample()
+            else:
+                try:
+                    parts = user_input.split()
+                    if len(parts) == 4:
+                        action = np.array([float(p) for p in parts], dtype=np.float32)
+                        action = np.clip(action, -1.0, 1.0)
+                    else:
+                        print("Invalid input. Enter 4 values or press Enter for random.")
+                        continue
+                except ValueError:
+                    print("Invalid input. Enter numeric values.")
+                    continue
+
+            obs, reward, terminated, truncated, info = env.step(action)
+
+            print(f"Step {i}:")
+            print(f"  Action: [{action[0]:.2f}, {action[1]:.2f}, {action[2]:.2f}, {action[3]:.2f}]")
+            print(f"  Position: [{info['position'][0]:.1f}, {info['position'][1]:.1f}, {info['position'][2]:.1f}]")
+            print(f"  Velocity: [{info['velocity'][0]:.2f}, {info['velocity'][1]:.2f}, {info['velocity'][2]:.2f}]")
+            print(f"  Reward: {reward:.3f}, Terminated: {terminated}, Truncated: {truncated}")
+
+            if terminated or truncated:
+                print("\nEpisode ended! Press Enter to reset or 'q' to quit.")
+                if input().strip().lower() == 'q':
+                    break
+                obs, info = env.reset()
+                print(f"Reset! Position: {info['position']}")
+
+        print("\nClosing environment.")
+        env.close()
+
+    elif args.mode == "velocity-train":
+        """Train a PPO agent with velocity control."""
+        print("=== Velocity Control PPO Training Mode ===")
+        print(f"Autopilot: {args.autopilot}, Max Velocity: {args.max_velocity} m/s")
+        print(f"Total timesteps: {args.timesteps}")
+
+        env = gym.make(
+            "AASVelocityEnv-v0",
+            gym_freq_hz=50,
+            autopilot=args.autopilot,
+            camera=args.camera,
+            lidar=args.lidar,
+            num_quads=args.num_quads,
+            max_velocity=args.max_velocity,
+            render_mode=None
+        )
+
+        # Validate environment
+        print("\nValidating environment...")
+        try:
+            sb3_check_env(env)
+            print("Environment passes all checks!")
+        except Exception as e:
+            print(f"Warning: Environment has issues: {e}")
+
+        # Test reset and step
+        print("\nTesting reset and step...")
+        obs, info = env.reset()
+        print(f"Observation shape: {obs.shape}")
+        print(f"Initial position: {info['position']}")
+
+        obs, reward, term, trunc, info = env.step(env.action_space.sample())
+        print(f"Step successful. Reward: {reward:.3f}")
+
+        # Create PPO agent
+        print("\nCreating PPO agent...")
+        model = PPO(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            device='cpu',
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=64,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.01,
+        )
+
+        # Train
+        print(f"\nTraining for {args.timesteps} timesteps...")
+        model.learn(total_timesteps=args.timesteps)
+        print("Training complete!")
+
+        # Save model
+        model_path = "ppo_velocity_agent.zip"
+        model.save(model_path)
+        print(f"Model saved to {model_path}")
+
+        # Test trained agent
+        print("\nTesting trained agent...")
+        obs, info = env.reset()
+        total_reward = 0
+        for step in range(500):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+
+            if step % 50 == 0:
+                print(f"Step {step}: pos={info['position']}, reward={reward:.2f}")
+
+            if terminated or truncated:
+                print(f"Episode ended at step {step}. Total reward: {total_reward:.2f}")
+                break
+
+        env.close()
+        print("Done!")
+
+    elif args.mode == "forward-flight":
+        """Train forward flight behavior."""
+        print("=== Forward Flight Training Mode ===")
+        print(f"Autopilot: {args.autopilot}")
+        print(f"Total timesteps: {args.timesteps}")
+
+        env = gym.make(
+            "AASForwardFlightEnv-v0",
+            gym_freq_hz=50,
+            autopilot=args.autopilot,
+            camera=False,
+            lidar=False,
+            num_quads=1,
+            max_velocity=args.max_velocity,
+            render_mode=None
+        )
+
+        # Validate environment
+        print("\nValidating environment...")
+        try:
+            sb3_check_env(env)
+            print("Environment passes all checks!")
+        except Exception as e:
+            print(f"Warning: Environment has issues: {e}")
+
+        # Create PPO agent
+        print("\nCreating PPO agent for forward flight...")
+        model = PPO(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            device='cpu',
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=64,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.01,
+        )
+
+        # Train
+        print(f"\nTraining forward flight for {args.timesteps} timesteps...")
+        model.learn(total_timesteps=args.timesteps)
+        print("Training complete!")
+
+        # Save model
+        model_path = "ppo_forward_flight.zip"
+        model.save(model_path)
+        print(f"Model saved to {model_path}")
+
+        # Test trained agent
+        print("\nTesting trained forward flight agent...")
+        obs, info = env.reset()
+        total_reward = 0
+        initial_x = info['position'][0]
+
+        for step in range(500):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+
+            if step % 50 == 0:
+                forward_dist = info['position'][0] - initial_x
+                print(f"Step {step}: forward={forward_dist:.1f}m, alt={info['position'][2]:.1f}m, reward={reward:.2f}")
+
+            if terminated or truncated:
+                forward_dist = info['position'][0] - initial_x
+                print(f"Episode ended at step {step}.")
+                print(f"Total forward distance: {forward_dist:.1f}m")
+                print(f"Total reward: {total_reward:.2f}")
+                break
+
+        env.close()
+        print("Done!")
 
     else:
         print(f"Unknown mode: {args.mode}")
