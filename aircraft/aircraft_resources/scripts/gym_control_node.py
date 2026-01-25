@@ -5,7 +5,7 @@ Gym Control Node - A Python ROS2 node for RL-based drone velocity control.
 This node runs in the aircraft container and provides:
 - ZMQ REP socket for receiving velocity commands from the gym environment
 - Subscribes to drone state topics (position, velocity, orientation)
-- Publishes velocity commands to the autopilot (ArduPilot via MAVROS or PX4)
+- Sets GUIDED mode and publishes velocity commands to MAVROS (ArduPilot)
 - Returns drone state observations to the gym environment
 
 Communication Protocol:
@@ -16,7 +16,7 @@ Communication Protocol:
 import argparse
 import struct
 import threading
-import os
+import time
 
 import numpy as np
 import zmq
@@ -31,6 +31,11 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import TwistStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import NavSatFix
+from std_msgs.msg import String
+
+# MAVROS services and messages
+from mavros_msgs.srv import SetMode, CommandBool
+from mavros_msgs.msg import State
 
 # Message types for PX4
 try:
@@ -66,6 +71,11 @@ class GymControlNode(Node):
         self.orientation = np.array([1.0, 0.0, 0.0, 0.0])  # quaternion w, x, y, z
         self.state_valid = False
 
+        # Drone state tracking
+        self.drone_armed = False
+        self.drone_mode = ""
+        self.guided_mode_set = False
+
         # Check simulation time
         if self.get_parameter('use_sim_time').as_bool():
             self.get_logger().info("Simulation time is enabled.")
@@ -89,6 +99,14 @@ class GymControlNode(Node):
             self._setup_px4(qos_profile)
         else:
             raise ValueError(f"Unsupported autopilot: {self.autopilot}")
+
+        # Create timer for periodic velocity publishing (needed to maintain GUIDED mode)
+        self.last_velocity_cmd = (0.0, 0.0, 0.0, 0.0)
+        self.velocity_publish_timer = self.create_timer(
+            0.1,  # 10 Hz
+            self._velocity_publish_callback,
+            callback_group=self.callback_group
+        )
 
         # ZMQ setup (runs in separate thread)
         self.zmq_running = True
@@ -118,6 +136,15 @@ class GymControlNode(Node):
             callback_group=self.callback_group
         )
 
+        # MAVROS state subscriber
+        self.state_sub = self.create_subscription(
+            State,
+            '/mavros/state',
+            self._mavros_state_callback,
+            qos_profile,
+            callback_group=self.callback_group
+        )
+
         # Global position for reference
         self.global_pos_sub = self.create_subscription(
             NavSatFix,
@@ -126,6 +153,10 @@ class GymControlNode(Node):
             qos_profile,
             callback_group=self.callback_group
         )
+
+        # Service clients for mode and arming
+        self.set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
+        self.arm_client = self.create_client(CommandBool, '/mavros/cmd/arming')
 
     def _setup_px4(self, qos_profile):
         """Setup publishers and subscribers for PX4."""
@@ -161,6 +192,11 @@ class GymControlNode(Node):
             qos_profile,
             callback_group=self.callback_group
         )
+
+    def _mavros_state_callback(self, msg: State):
+        """Handle MAVROS state updates."""
+        self.drone_armed = msg.armed
+        self.drone_mode = msg.mode
 
     def _ardupilot_odom_callback(self, msg: Odometry):
         """Handle ArduPilot odometry (ENU frame)."""
@@ -211,6 +247,47 @@ class GymControlNode(Node):
             self.orientation[2] = msg.q[2]  # y
             self.orientation[3] = msg.q[3]  # z
 
+    def _set_guided_mode(self) -> bool:
+        """Set ArduPilot to GUIDED mode for velocity control."""
+        if self.autopilot != "ardupilot":
+            return True
+
+        if self.drone_mode == "GUIDED":
+            self.get_logger().info("Already in GUIDED mode")
+            return True
+
+        if not self.set_mode_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error("Set mode service not available")
+            return False
+
+        request = SetMode.Request()
+        request.custom_mode = "GUIDED"
+
+        future = self.set_mode_client.call_async(request)
+        # Wait for result with timeout
+        start_time = time.time()
+        while not future.done() and (time.time() - start_time) < 5.0:
+            time.sleep(0.1)
+
+        if future.done():
+            result = future.result()
+            if result.mode_sent:
+                self.get_logger().info("GUIDED mode set successfully")
+                self.guided_mode_set = True
+                return True
+            else:
+                self.get_logger().error("Failed to set GUIDED mode")
+                return False
+        else:
+            self.get_logger().error("Set mode service call timed out")
+            return False
+
+    def _velocity_publish_callback(self):
+        """Periodic callback to publish velocity commands (maintains GUIDED mode)."""
+        if self.autopilot == "ardupilot" and self.guided_mode_set:
+            vx, vy, vz, yaw_rate = self.last_velocity_cmd
+            self._publish_velocity_ardupilot(vx, vy, vz, yaw_rate)
+
     def _publish_velocity_ardupilot(self, vx: float, vy: float, vz: float, yaw_rate: float):
         """Publish velocity command for ArduPilot."""
         msg = TwistStamped()
@@ -218,12 +295,12 @@ class GymControlNode(Node):
         msg.header.frame_id = "map"  # World frame
 
         # Linear velocity (ENU: x=East, y=North, z=Up)
-        msg.twist.linear.x = vx   # East
-        msg.twist.linear.y = vy   # North
-        msg.twist.linear.z = vz   # Up
+        msg.twist.linear.x = float(vx)   # East
+        msg.twist.linear.y = float(vy)   # North
+        msg.twist.linear.z = float(vz)   # Up
 
         # Angular velocity (yaw rate)
-        msg.twist.angular.z = yaw_rate
+        msg.twist.angular.z = float(yaw_rate)
 
         self.vel_pub.publish(msg)
 
@@ -241,17 +318,23 @@ class GymControlNode(Node):
 
         # Velocity (NED: x=North, y=East, z=Down)
         # Convert from user-friendly (forward, right, up) to NED
-        traj_msg.velocity[0] = vx   # North
-        traj_msg.velocity[1] = vy   # East
-        traj_msg.velocity[2] = -vz  # Down (negative of up)
+        traj_msg.velocity[0] = float(vx)   # North
+        traj_msg.velocity[1] = float(vy)   # East
+        traj_msg.velocity[2] = float(-vz)  # Down (negative of up)
 
-        traj_msg.yawspeed = yaw_rate
+        traj_msg.yawspeed = float(yaw_rate)
 
         self.trajectory_pub.publish(traj_msg)
 
     def publish_velocity(self, vx: float, vy: float, vz: float, yaw_rate: float):
         """Publish velocity command to the appropriate autopilot."""
+        # Store for periodic publishing
+        self.last_velocity_cmd = (vx, vy, vz, yaw_rate)
+
         if self.autopilot == "ardupilot":
+            # Ensure we're in GUIDED mode first
+            if not self.guided_mode_set:
+                self._set_guided_mode()
             self._publish_velocity_ardupilot(vx, vy, vz, yaw_rate)
         elif self.autopilot == "px4":
             self._publish_velocity_px4(vx, vy, vz, yaw_rate)
@@ -294,6 +377,7 @@ class GymControlNode(Node):
                         if abs(vx - self.RESET_SIGNAL) < 0.001:
                             self.get_logger().info("Received reset signal")
                             # On reset, just return current state without publishing
+                            self.guided_mode_set = False  # Reset guided mode flag
                         else:
                             # Publish velocity command
                             self.publish_velocity(vx, vy, vz, yaw_rate)
