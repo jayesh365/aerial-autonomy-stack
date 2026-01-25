@@ -75,6 +75,7 @@ class GymControlNode(Node):
         self.drone_armed = False
         self.drone_mode = ""
         self.guided_mode_set = False
+        self.mavros_connected = False
 
         # Check simulation time
         if self.get_parameter('use_sim_time').as_bool():
@@ -107,6 +108,10 @@ class GymControlNode(Node):
             self._velocity_publish_callback,
             callback_group=self.callback_group
         )
+
+        # Wait for MAVROS to be ready before starting ZMQ
+        self.get_logger().info("Waiting for MAVROS state data...")
+        self._wait_for_mavros_ready()
 
         # ZMQ setup (runs in separate thread)
         self.zmq_running = True
@@ -197,6 +202,33 @@ class GymControlNode(Node):
         """Handle MAVROS state updates."""
         self.drone_armed = msg.armed
         self.drone_mode = msg.mode
+        self.mavros_connected = msg.connected
+
+    def _wait_for_mavros_ready(self):
+        """Wait for MAVROS to be connected and receiving data."""
+        self.mavros_connected = False
+        max_wait = 120  # seconds
+        start_time = time.time()
+
+        while (time.time() - start_time) < max_wait:
+            # Spin to process callbacks
+            rclpy.spin_once(self, timeout_sec=0.5)
+
+            # Check if we have valid state data
+            with self.state_lock:
+                has_position = self.state_valid and not np.allclose(self.position, [0, 0, 0])
+
+            if self.mavros_connected and has_position:
+                self.get_logger().info(f"MAVROS ready! Armed: {self.drone_armed}, Mode: {self.drone_mode}")
+                self.get_logger().info(f"Position: {self.position}")
+                return True
+
+            elapsed = int(time.time() - start_time)
+            if elapsed % 10 == 0 and elapsed > 0:
+                self.get_logger().info(f"Still waiting for MAVROS... ({elapsed}s) connected={self.mavros_connected}, valid={self.state_valid}")
+
+        self.get_logger().warn("Timeout waiting for MAVROS - proceeding anyway")
+        return False
 
     def _ardupilot_odom_callback(self, msg: Odometry):
         """Handle ArduPilot odometry (ENU frame)."""
