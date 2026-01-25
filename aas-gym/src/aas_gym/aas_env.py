@@ -577,7 +577,12 @@ class AASVelocityEnv(AASEnv):
                 return False
 
         except zmq.error.Again:
-            print("Aircraft ZMQ Error: Timeout waiting for state")
+            print("Aircraft ZMQ Error: Timeout waiting for state - reconnecting...")
+            self._reconnect_aircraft_zmq()
+            return False
+        except zmq.error.ZMQError as e:
+            print(f"Aircraft ZMQ Error: {e} - reconnecting...")
+            self._reconnect_aircraft_zmq()
             return False
         except struct.error as e:
             print(f"Aircraft ZMQ Error: Struct error: {e}")
@@ -585,6 +590,27 @@ class AASVelocityEnv(AASEnv):
         except Exception as e:
             print(f"Aircraft ZMQ Error: {e}")
             return False
+
+    def _reconnect_aircraft_zmq(self):
+        """Reconnect the aircraft ZMQ socket after an error."""
+        try:
+            if self.aircraft_socket is not None:
+                self.aircraft_socket.close(linger=0)
+        except Exception:
+            pass
+
+        # Small delay before reconnecting
+        time.sleep(0.5)
+
+        # Recreate socket
+        self.aircraft_socket = self.zmq_context.socket(zmq.REQ)
+        self.aircraft_socket.setsockopt(zmq.RCVTIMEO, 10 * 1000)
+        self.aircraft_socket.setsockopt(zmq.SNDTIMEO, 10 * 1000)
+        self.aircraft_socket.setsockopt(zmq.LINGER, 0)
+
+        aircraft_ip = f"{self.SIM_SUBNET}.90.1"
+        self.aircraft_socket.connect(f"tcp://{aircraft_ip}:{self.aircraft_zmq_port}")
+        print(f"Aircraft ZMQ socket reconnected to {aircraft_ip}:{self.aircraft_zmq_port}")
 
     def reset(self, seed=None, options=None):
         """Reset the environment."""
