@@ -10,7 +10,7 @@ from gymnasium.utils.env_checker import check_env
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env as sb3_check_env
 
-from aas_gym.aas_env import AASEnv, AASVelocityEnv, AASForwardFlightEnv
+from aas_gym.aas_env import AASEnv, AASVelocityEnv, AASForwardFlightEnv, AASSimpleCommandEnv
 
 
 # Register the environments so we can create them with gym.make()
@@ -29,11 +29,17 @@ gym.register(
     entry_point=AASForwardFlightEnv,
 )
 
+gym.register(
+    id="AASSimpleCommandEnv-v0",
+    entry_point=AASSimpleCommandEnv,
+)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, default="step", choices=[
         "step", "speedup", "vectorenv-speedup", "learn",
-        "velocity-step", "velocity-train", "forward-flight"
+        "velocity-step", "velocity-train", "forward-flight",
+        "simple-command"
     ])
     parser.add_argument("--repetitions", type=int, default=1),
     parser.add_argument("--autopilot", type=str, default="ardupilot", choices=["px4", "ardupilot"])
@@ -429,6 +435,121 @@ def main():
                 print(f"Total reward: {total_reward:.2f}")
                 break
 
+        env.close()
+        print("Done!")
+
+    elif args.mode == "simple-command":
+        """Interactive drone control with simple discrete commands."""
+        print("=" * 60)
+        print("=== SIMPLE COMMAND DRONE CONTROL ===")
+        print("=" * 60)
+        print(f"Autopilot: {args.autopilot}")
+        print(f"Movement velocity: {args.max_velocity} m/s")
+        print("\nThe drone will automatically take off and hover.")
+        print("Then you can control it with simple commands.")
+        print("=" * 60)
+
+        env = gym.make(
+            "AASSimpleCommandEnv-v0",
+            gym_freq_hz=10,  # Lower frequency for interactive control
+            autopilot=args.autopilot,
+            camera=args.camera,
+            lidar=args.lidar,
+            num_quads=args.num_quads,
+            move_velocity=args.max_velocity,
+            takeoff_altitude=40.0,
+            render_mode="human"  # Show Gazebo GUI
+        )
+
+        obs, info = env.reset()
+
+        print("\n" + "=" * 60)
+        print("CONTROLS:")
+        print("  w / f - Move FORWARD")
+        print("  a / l - Move LEFT")
+        print("  d / r - Move RIGHT")
+        print("  s / b - Move BACKWARD")
+        print("  h / (space/empty) - HOVER (stop)")
+        print("  reset - Reset environment (restart episode)")
+        print("  q / quit - Quit and close")
+        print("=" * 60)
+        print("\nEnter a command and press Enter:")
+
+        step_count = 0
+        running = True
+
+        while running:
+            try:
+                user_input = input("\nCommand> ").strip().lower()
+
+                # Parse command
+                if user_input in ('q', 'quit', 'exit'):
+                    print("\nQuitting...")
+                    running = False
+                    break
+
+                elif user_input in ('reset', 'restart'):
+                    print("\nResetting environment...")
+                    obs, info = env.reset()
+                    step_count = 0
+                    print("Reset complete! Ready for commands.")
+                    continue
+
+                elif user_input in ('w', 'f', 'forward'):
+                    action = env.unwrapped.ACTION_FORWARD
+                elif user_input in ('a', 'l', 'left'):
+                    action = env.unwrapped.ACTION_LEFT
+                elif user_input in ('d', 'r', 'right'):
+                    action = env.unwrapped.ACTION_RIGHT
+                elif user_input in ('s', 'b', 'back', 'backward'):
+                    action = env.unwrapped.ACTION_BACKWARD
+                elif user_input in ('h', 'hover', 'stop', ''):
+                    action = env.unwrapped.ACTION_HOVER
+                else:
+                    # Try to parse as a number
+                    try:
+                        action = int(user_input)
+                        if action < 0 or action > 4:
+                            print("Invalid action number. Use 0-4.")
+                            continue
+                    except ValueError:
+                        print(f"Unknown command: '{user_input}'")
+                        print("Use: w/f=forward, a/l=left, d/r=right, s/b=backward, h=hover, reset, q=quit")
+                        continue
+
+                # Execute the action multiple times to make movement visible
+                num_steps = 5  # Execute 5 steps per command for noticeable movement
+                total_reward = 0
+
+                for _ in range(num_steps):
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    total_reward += reward
+                    step_count += 1
+
+                    if terminated or truncated:
+                        break
+
+                # Print status
+                pos = info['position']
+                vel = info['velocity']
+                print(f"[{info['action_name']:8s}] "
+                      f"Pos: ({pos[0]:7.1f}, {pos[1]:7.1f}, {pos[2]:6.1f}) | "
+                      f"Vel: ({vel[0]:5.1f}, {vel[1]:5.1f}, {vel[2]:5.1f}) | "
+                      f"Reward: {total_reward:.2f}")
+
+                if terminated:
+                    print("\n*** Episode TERMINATED ***")
+                    print("Enter 'reset' to restart or 'q' to quit.")
+                elif truncated:
+                    print("\n*** Episode TRUNCATED (time limit) ***")
+                    print("Enter 'reset' to restart or 'q' to quit.")
+
+            except KeyboardInterrupt:
+                print("\n\nInterrupted! Closing...")
+                running = False
+                break
+
+        print("\nClosing environment...")
         env.close()
         print("Done!")
 
