@@ -160,60 +160,172 @@ class AASEnv(gym.Env):
 
 ---
 
-## Key Questions / Areas to Investigate
+## CRITICAL FINDING: The Gap
 
-1. **How does the gym environment interface with the simulation?**
-   - Currently uses ZMQ for clock synchronization
-   - Actions appear to be dummy (not connected to actual control)
+After reading the actual code, here's what we discovered:
 
-2. **What is the control flow for commands?**
-   - Gym → ??? → autopilot_interface → MAVROS → PX4/ArduPilot
+### What Currently Exists
 
-3. **What topics/services are available for control?**
-   - Need to map out ROS2 topics/services/actions
-
-4. **What is the state representation for RL?**
-   - Currently just sim clock - not useful for learning
-
-5. **How does stepping work?**
-   - `gz_step.py` suggests Gazebo can be stepped manually
-   - Need to understand the stepping mechanism
-
----
-
-## Communication Architecture
-
-```
-┌─────────────────┐     ZMQ      ┌─────────────────┐
-│    AAS-GYM      │◄────────────►│   SIMULATION    │
-│  (Python/Host)  │   (clock)    │   (Docker)      │
-└─────────────────┘              │                 │
-                                 │  ┌───────────┐  │
-                                 │  │  Gazebo   │  │
-                                 │  │  + SITL   │  │
-                                 │  └─────┬─────┘  │
-                                 │        │MAVLink │
-                                 │  ┌─────▼─────┐  │
-                                 │  │  MAVROS   │  │
-                                 │  └─────┬─────┘  │
-                                 │        │ROS2    │
-                                 │  ┌─────▼─────┐  │
-                                 │  │ AIRCRAFT  │  │
-                                 │  │   STACK   │  │
-                                 │  └───────────┘  │
-                                 └─────────────────┘
+**`aas_env.py` (Python gym environment):**
+```python
+# Sends action via ZMQ
+action_payload = struct.pack('d', force)  # force is a single float [-1, 1]
+self.socket.send(action_payload)
+reply_bytes = self.socket.recv()  # Gets clock back
 ```
 
+**`zeromq_bridge.cpp` (C++ ROS2 node in simulation container):**
+```cpp
+// Receives action from gym
+double action = *static_cast<double*>(request.data());
+
+// If action == 9999.0 → RESET mode (unpause for 80s, then pause)
+// Else → STEP mode:
+//   1. Publish action to /action topic
+publisher_->publish(ros_msg);  // publishes Float64 to "/action"
+//   2. Step Gazebo
+step_gazebo();
+//   3. Return clock
+socket_.send(reply);
+```
+
+### The Problem: Nobody Listens to `/action`
+
+The ZMQ bridge **publishes** the action to ROS2 topic `/action`, but:
+
+**NOTHING IN THE AIRCRAFT STACK SUBSCRIBES TO `/action`**
+
+The aircraft stack only has:
+- ROS2 **Actions** (not topics): `/DroneN/takeoff_action`, `/DroneN/land_action`, `/DroneN/orbit_action`, `/DroneN/offboard_action`
+- ROS2 **Services**: `/DroneN/set_speed`, `/DroneN/set_reposition`
+
+These are completely different from a simple topic subscription.
+
+### Current Data Flow (Broken)
+
+```
+┌──────────────┐                    ┌─────────────────────────────────────────┐
+│   aas_env    │                    │         SIMULATION CONTAINER            │
+│   (Python)   │                    │                                         │
+│              │   ZMQ TCP:5555     │  ┌─────────────────┐                    │
+│  step(act)  ─┼───────────────────►│  │  zeromq_bridge  │                    │
+│              │                    │  │                 │                    │
+│              │   [sec, nanosec]   │  │  publishes to   │    ┌────────────┐  │
+│  ◄───────────┼────────────────────┼──┤  /action topic ─┼───►│  NOWHERE   │  │
+│              │                    │  │                 │    │  (no sub)  │  │
+└──────────────┘                    │  │  steps Gazebo   │    └────────────┘  │
+                                    │  └─────────────────┘                    │
+                                    │                                         │
+                                    │  ┌─────────────────┐                    │
+                                    │  │  AIRCRAFT STACK │ (separate container)
+                                    │  │                 │                    │
+                                    │  │  - autopilot_   │                    │
+                                    │  │    interface    │ ← Only listens to  │
+                                    │  │  - mission      │   ROS2 Actions,    │
+                                    │  │  - offboard_    │   not /action topic│
+                                    │  │    control      │                    │
+                                    │  └─────────────────┘                    │
+                                    └─────────────────────────────────────────┘
+```
+
+### What the Gym Environment Actually Does Now
+
+1. **On reset()**:
+   - Restarts Docker containers
+   - Sends action=9999.0 to ZMQ bridge
+   - Bridge unpauses Gazebo for 80 seconds (init period)
+   - Bridge pauses Gazebo, returns clock
+   - During those 80 seconds, the mission node runs and does whatever the mission YAML says
+
+2. **On step(action)**:
+   - Sends action (a single float) to ZMQ bridge
+   - Bridge publishes to `/action` (nobody listening)
+   - Bridge steps Gazebo by N physics steps
+   - Bridge returns the new clock time
+   - **The action has NO EFFECT on the drone**
+
 ---
 
-## Next Steps for Discussion
+## Available Control Interfaces in Aircraft Stack
 
-1. What is the specific goal? (RL training, scripted testing, custom control?)
-2. What observations do we need from the simulation?
-3. What actions do we want to send?
-4. Do we need single-drone or multi-drone control?
-5. What is the reward function (if RL)?
+### High-Level Control (autopilot_interface)
+
+**ROS2 Actions** (long-running, cancellable operations):
+| Action | Purpose | Parameters |
+|--------|---------|------------|
+| `/DroneN/takeoff_action` | Take off and hover | `takeoff_altitude`, `vtol_transition_heading`, etc. |
+| `/DroneN/land_action` | Land the drone | `landing_altitude`, `vtol_transition_heading` |
+| `/DroneN/orbit_action` | Fly in a circle | `east`, `north`, `altitude`, `radius` |
+| `/DroneN/offboard_action` | Enter offboard/guided mode | `offboard_setpoint_type`, `max_duration_sec` |
+
+**ROS2 Services** (instant commands):
+| Service | Purpose | Parameters |
+|---------|---------|------------|
+| `/DroneN/set_speed` | Set flight speed | `speed` (float) |
+| `/DroneN/set_reposition` | Go to position | `east`, `north`, `altitude` |
+
+### Low-Level Control (offboard_control)
+
+When in offboard mode, the drone listens to setpoints:
+
+**PX4**:
+- Attitude setpoints
+- Rate setpoints
+- Trajectory setpoints
+
+**ArduPilot**:
+- Velocity commands via MAVROS `/mavros/setpoint_velocity/cmd_vel`
 
 ---
 
-*Last updated: Research phase - no code changes made*
+## Goal: Drone Takeoff, Hover, User Commands
+
+Based on your stated goal, here's what we need:
+
+### Option A: Use Existing High-Level Interface
+- Call `/DroneN/takeoff_action` to take off
+- Use `/DroneN/set_reposition` to move
+- Simple but coarse control
+
+### Option B: Use Offboard/Guided Mode for Velocity Control
+- Call `/DroneN/takeoff_action` to take off
+- Call `/DroneN/offboard_action` to enter offboard mode
+- Send velocity commands directly
+- More fine-grained control
+
+### What Needs to Be Built
+
+1. **A new ROS2 node** (or modify zeromq_bridge) that:
+   - Subscribes to `/action` topic
+   - Translates gym actions to actual drone commands
+   - OR: Directly call ROS2 actions/services from the bridge
+
+2. **Modify aas_env.py** to:
+   - Define meaningful action space (e.g., velocity commands)
+   - Define meaningful observation space (e.g., position, velocity)
+   - Handle takeoff as part of reset()
+
+3. **Decide on action/observation format**:
+   - What does action `[-1, 1]` mean? (velocity? direction?)
+   - What observations do we return? (position? orientation?)
+
+---
+
+## Questions Before We Code
+
+1. **Control granularity**:
+   - High-level (go to waypoint) or low-level (velocity commands)?
+
+2. **Observation needs**:
+   - Just position/velocity, or also camera/lidar?
+
+3. **Takeoff handling**:
+   - Should reset() automatically takeoff and hover?
+   - Or should takeoff be an explicit action?
+
+4. **Autopilot**:
+   - PX4 or ArduPilot? (Different control interfaces)
+
+---
+
+*Last updated: After code analysis - identified the gap*
