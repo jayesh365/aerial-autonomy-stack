@@ -233,11 +233,42 @@ class GymnasiumSetup(Node):
             self.get_logger().error('Failed to connect to MAVROS')
             return False
 
-        # Step 2: Wait for ArduPilot EKF/pre-arm checks to pass
-        # ArduPilot SITL needs ~40s for GPS lock and EKF convergence
-        self.get_logger().info('Step 2: Waiting for ArduPilot EKF/pre-arm checks...')
-        if not self.wait_for_ekf_ready(timeout=60.0):
-            self.get_logger().warn('EKF not fully ready, will retry takeoff with delays')
+        # Step 2: Wait for ArduPilot SITL pre-arm checks
+        # CRITICAL: ArduPilot SITL needs ~40 seconds of WALL CLOCK TIME for:
+        #   - GPS lock and home position
+        #   - EKF convergence
+        #   - Gyro calibration
+        #   - AHRS initialization
+        # The simulation's GYM_INIT_DURATION is in SIM time (with RTF=15, 80s sim = 5s real)
+        # So we MUST wait here for real wall-clock time.
+        self.get_logger().info('Step 2: Waiting for ArduPilot SITL initialization...')
+        self.get_logger().info('(ArduPilot needs ~40s wall-clock for GPS/EKF/gyro calibration)')
+
+        # Wait for system_status to reach STANDBY, with minimum 40s wall-clock wait
+        init_start = time.time()
+        min_wait_seconds = 40.0  # Minimum wall-clock time to wait
+
+        while True:
+            rclpy.spin_once(self, timeout_sec=1.0)
+            elapsed = time.time() - init_start
+
+            # Check if we have valid status AND enough time has passed
+            if self.system_status >= 3 and elapsed >= min_wait_seconds:
+                self.get_logger().info(f'ArduPilot ready after {elapsed:.1f}s! Status: {self.system_status}')
+                break
+
+            # Timeout after 90 seconds
+            if elapsed > 90.0:
+                self.get_logger().warn(f'Timeout waiting for ArduPilot. Status: {self.system_status}')
+                break
+
+            # Progress logging every 10 seconds
+            if int(elapsed) % 10 == 0 and int(elapsed) > 0:
+                remaining = max(0, min_wait_seconds - elapsed)
+                self.get_logger().info(
+                    f'Waiting... ({elapsed:.0f}s elapsed, {remaining:.0f}s min remaining) '
+                    f'status={self.system_status}, mode={self.drone_mode}, armed={self.drone_armed}'
+                )
 
         # Step 3: Send takeoff command (with extended retries for arming)
         self.get_logger().info('Step 3: Sending takeoff command...')
