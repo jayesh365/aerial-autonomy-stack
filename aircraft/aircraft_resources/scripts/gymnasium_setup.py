@@ -44,6 +44,7 @@ class GymnasiumSetup(Node):
         self.drone_mode = ""
         self.mavros_connected = False
         self.position_valid = False
+        self.system_status = 0  # MAV_STATE: 0=uninit, 3=standby (ready to arm), 4=active
 
         # Action clients
         self.takeoff_client = ActionClient(self, Takeoff, f'/Drone{drone_id}/takeoff_action')
@@ -86,6 +87,7 @@ class GymnasiumSetup(Node):
         self.mavros_connected = msg.connected
         self.drone_armed = msg.armed
         self.drone_mode = msg.mode
+        self.system_status = msg.system_status  # MAV_STATE: 3=STANDBY (ready to arm)
 
     def wait_for_server(self, client, name, timeout=60.0):
         """Wait for action server with timeout."""
@@ -118,6 +120,36 @@ class GymnasiumSetup(Node):
                 self.get_logger().info(f'Still waiting for MAVROS... ({elapsed}s)')
 
         self.get_logger().warn('Timeout waiting for MAVROS')
+        return False
+
+    def wait_for_ekf_ready(self, timeout=60.0):
+        """
+        Wait for ArduPilot EKF to be ready for arming.
+
+        ArduPilot SITL needs ~40 seconds for pre-arm checks (GPS lock, EKF convergence).
+        We check system_status == 3 (MAV_STATE_STANDBY) which indicates ready to arm.
+        """
+        self.get_logger().info('Waiting for ArduPilot EKF/pre-arm checks...')
+        self.get_logger().info('(This takes ~40s for ArduPilot SITL GPS/EKF convergence)')
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            rclpy.spin_once(self, timeout_sec=0.5)
+
+            # MAV_STATE_STANDBY (3) = Ready to arm
+            # MAV_STATE_ACTIVE (4) = Already armed
+            if self.system_status >= 3:
+                self.get_logger().info(f'ArduPilot ready! System status: {self.system_status} (3=STANDBY, 4=ACTIVE)')
+                return True
+
+            elapsed = int(time.time() - start_time)
+            if elapsed % 10 == 0 and elapsed > 0:
+                self.get_logger().info(
+                    f'Waiting for EKF... ({elapsed}s) '
+                    f'status={self.system_status} (need >=3), mode={self.drone_mode}'
+                )
+
+        self.get_logger().warn(f'Timeout waiting for EKF. Current status: {self.system_status}')
         return False
 
     def send_takeoff(self):
@@ -196,32 +228,41 @@ class GymnasiumSetup(Node):
         self.get_logger().info('='*50)
 
         # Step 1: Wait for MAVROS to be ready
-        self.get_logger().info('Step 1: Waiting for MAVROS...')
+        self.get_logger().info('Step 1: Waiting for MAVROS connection...')
         if not self.wait_for_mavros(timeout=120.0):
             self.get_logger().error('Failed to connect to MAVROS')
             return False
 
-        # Step 2: Send takeoff command
-        self.get_logger().info('Step 2: Sending takeoff command...')
+        # Step 2: Wait for ArduPilot EKF/pre-arm checks to pass
+        # ArduPilot SITL needs ~40s for GPS lock and EKF convergence
+        self.get_logger().info('Step 2: Waiting for ArduPilot EKF/pre-arm checks...')
+        if not self.wait_for_ekf_ready(timeout=60.0):
+            self.get_logger().warn('EKF not fully ready, will retry takeoff with delays')
+
+        # Step 3: Send takeoff command (with extended retries for arming)
+        self.get_logger().info('Step 3: Sending takeoff command...')
         takeoff_success = False
-        max_retries = 3
+        max_retries = 5  # Increased retries
+        retry_delay = 10.0  # Longer delay between retries for EKF to converge
         for attempt in range(max_retries):
             if self.send_takeoff():
                 takeoff_success = True
                 break
-            self.get_logger().warn(f'Takeoff attempt {attempt+1} failed, retrying...')
-            self.spin_wait(2.0)
+            self.get_logger().warn(f'Takeoff attempt {attempt+1}/{max_retries} failed')
+            if attempt < max_retries - 1:
+                self.get_logger().info(f'Waiting {retry_delay}s before retry (ArduPilot may need more time)...')
+                self.spin_wait(retry_delay)
 
         if not takeoff_success:
             self.get_logger().error('Failed to takeoff after multiple attempts')
             return False
 
-        # Step 3: Wait for drone to reach altitude
-        self.get_logger().info('Step 3: Waiting for target altitude...')
+        # Step 4: Wait for drone to reach altitude
+        self.get_logger().info('Step 4: Waiting for target altitude...')
         self.wait_for_altitude(self.takeoff_altitude, tolerance=3.0, timeout=60.0)
 
-        # Step 4: Stabilization wait (like "wait: 5.0" in mission)
-        self.get_logger().info('Step 4: Stabilization wait...')
+        # Step 5: Stabilization wait (like "wait: 5.0" in mission)
+        self.get_logger().info('Step 5: Stabilization wait...')
         self.spin_wait(5.0)
 
         self.get_logger().info('='*50)
