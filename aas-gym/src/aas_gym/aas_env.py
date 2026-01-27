@@ -872,3 +872,297 @@ class AASForwardFlightEnv(AASVelocityEnv):
                 return True
 
         return False
+
+
+class AASSimpleCommandEnv(AASVelocityEnv):
+    """
+    Simplified environment with discrete movement commands.
+
+    The drone automatically takes off to a set altitude and hovers.
+    Then it accepts simple discrete commands to move at a constant velocity.
+
+    Action Space (Discrete):
+        0: HOVER - Stay in place (zero velocity)
+        1: FORWARD - Move forward (positive X in ENU)
+        2: LEFT - Move left (positive Y in ENU)
+        3: RIGHT - Move right (negative Y in ENU)
+        4: BACKWARD - Move backward (negative X in ENU)
+
+    The drone maintains altitude automatically while moving.
+
+    Observation Space: [x, y, z, vx, vy, vz, qw, qx, qy, qz]
+
+    Use reset() to restart the episode (drone returns to start and takes off again).
+    Use close() to quit and clean up resources.
+    """
+
+    # Action constants
+    ACTION_HOVER = 0
+    ACTION_FORWARD = 1
+    ACTION_LEFT = 2
+    ACTION_RIGHT = 3
+    ACTION_BACKWARD = 4
+
+    ACTION_NAMES = {
+        0: "HOVER",
+        1: "FORWARD",
+        2: "LEFT",
+        3: "RIGHT",
+        4: "BACKWARD"
+    }
+
+    def __init__(self,
+            instance: int = 0,
+            gym_freq_hz: int = 10,  # Lower frequency for manual control
+            autopilot: str = "ardupilot",
+            camera: bool = False,
+            lidar: bool = False,
+            num_quads: int = 1,
+            render_mode = "ansi",  # Default to ANSI rendering for status display
+            move_velocity: float = 2.0,  # Constant velocity in m/s
+            takeoff_altitude: float = 40.0,  # Altitude to take off and hover at
+            altitude_tolerance: float = 3.0,  # Tolerance for altitude check
+        ):
+        """
+        Initialize the simple command drone environment.
+
+        Args:
+            instance: Environment instance ID
+            gym_freq_hz: Control frequency (lower for manual control)
+            autopilot: Autopilot type (default: ardupilot)
+            camera: Enable camera (default: False for faster startup)
+            lidar: Enable lidar (default: False for faster startup)
+            num_quads: Number of drones (default: 1)
+            render_mode: Rendering mode ("ansi" shows status, "human" for GUI)
+            move_velocity: Constant velocity for movement commands in m/s
+            takeoff_altitude: Target altitude for takeoff and hover
+            altitude_tolerance: Tolerance for altitude maintenance
+        """
+        # Initialize parent with velocity control capabilities
+        super().__init__(
+            instance=instance,
+            gym_freq_hz=gym_freq_hz,
+            autopilot=autopilot,
+            camera=camera,
+            lidar=lidar,
+            num_quads=num_quads,
+            render_mode=render_mode,
+            max_velocity=move_velocity,  # Use move_velocity as max
+            max_yaw_rate=0.5,  # Fixed yaw rate
+        )
+
+        self.move_velocity = move_velocity
+        self.takeoff_altitude = takeoff_altitude
+        self.altitude_tolerance = altitude_tolerance
+
+        # Override action space to be discrete
+        self.action_space = gym.spaces.Discrete(5)
+
+        # State tracking
+        self.is_flying = False
+        self.initial_position = None
+        self.current_action = self.ACTION_HOVER
+        self.last_action_name = "HOVER"
+
+        # Reduce max episode length for interactive use
+        self.MAX_EPISODE_LENGTH_SEC = 600.0  # 10 minutes
+        self.max_steps = int(self.MAX_EPISODE_LENGTH_SEC * self.GYM_FREQ_HZ)
+
+    def _wait_for_takeoff_complete(self, timeout: float = 120.0) -> bool:
+        """
+        Wait for the drone to reach takeoff altitude.
+        The gymnasium_setup.py handles the actual takeoff command.
+        This method monitors until the drone reaches altitude.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+
+        Returns:
+            True if takeoff completed, False if timeout
+        """
+        print(f"\nWaiting for drone to reach altitude {self.takeoff_altitude}m...")
+        print("(The gymnasium_setup node handles takeoff automatically)")
+
+        start_time = time.time()
+        last_print_time = 0
+
+        while (time.time() - start_time) < timeout:
+            # Get current state
+            try:
+                self._send_velocity_command(0.0, 0.0, 0.0, 0.0)
+            except Exception:
+                time.sleep(0.5)
+                continue
+
+            current_altitude = self.drone_position[2]  # ENU: z is up
+
+            # Print progress every 5 seconds
+            elapsed = int(time.time() - start_time)
+            if elapsed > last_print_time and elapsed % 5 == 0:
+                print(f"  Current altitude: {current_altitude:.1f}m / {self.takeoff_altitude}m (elapsed: {elapsed}s)")
+                last_print_time = elapsed
+
+            # Check if we've reached altitude
+            if current_altitude >= (self.takeoff_altitude - self.altitude_tolerance):
+                print(f"\nTakeoff complete! Altitude: {current_altitude:.1f}m")
+                self.is_flying = True
+                return True
+
+            time.sleep(0.5)
+
+        print(f"\nWarning: Takeoff timeout. Current altitude: {self.drone_position[2]:.1f}m")
+        return False
+
+    def reset(self, seed=None, options=None):
+        """
+        Reset the environment.
+
+        This will:
+        1. Restart containers (handled by parent)
+        2. Wait for automatic takeoff to complete
+        3. Return initial observation
+        """
+        print("\n" + "="*60)
+        print("RESETTING ENVIRONMENT")
+        print("="*60)
+
+        # Call parent reset (restarts containers, connects ZMQ)
+        obs, info = super().reset(seed=seed, options=options)
+
+        # Wait for takeoff to complete
+        self._wait_for_takeoff_complete(timeout=120.0)
+
+        # Record initial position
+        self.initial_position = self.drone_position.copy()
+        self.current_action = self.ACTION_HOVER
+        self.last_action_name = "HOVER"
+
+        print("\n" + "="*60)
+        print("ENVIRONMENT READY")
+        print(f"Position: x={self.drone_position[0]:.1f}, y={self.drone_position[1]:.1f}, z={self.drone_position[2]:.1f}")
+        print(f"Commands: HOVER(0), FORWARD(1), LEFT(2), RIGHT(3), BACKWARD(4)")
+        print("="*60 + "\n")
+
+        return self._get_obs(), self._get_info()
+
+    def step(self, action: int):
+        """
+        Execute one step with a discrete action.
+
+        Args:
+            action: Discrete action (0=HOVER, 1=FORWARD, 2=LEFT, 3=RIGHT, 4=BACKWARD)
+
+        Returns:
+            observation, reward, terminated, truncated, info
+        """
+        # Convert discrete action to velocity command
+        self.current_action = action
+        self.last_action_name = self.ACTION_NAMES.get(action, "UNKNOWN")
+
+        # Map discrete action to velocity
+        if action == self.ACTION_HOVER:
+            vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
+        elif action == self.ACTION_FORWARD:
+            vx, vy, vz, yaw_rate = self.move_velocity, 0.0, 0.0, 0.0
+        elif action == self.ACTION_LEFT:
+            vx, vy, vz, yaw_rate = 0.0, self.move_velocity, 0.0, 0.0
+        elif action == self.ACTION_RIGHT:
+            vx, vy, vz, yaw_rate = 0.0, -self.move_velocity, 0.0, 0.0
+        elif action == self.ACTION_BACKWARD:
+            vx, vy, vz, yaw_rate = -self.move_velocity, 0.0, 0.0, 0.0
+        else:
+            print(f"Warning: Unknown action {action}, defaulting to HOVER")
+            vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
+
+        # Add altitude hold - maintain takeoff altitude
+        altitude_error = self.takeoff_altitude - self.drone_position[2]
+        # Simple P controller for altitude
+        vz = np.clip(altitude_error * 0.5, -2.0, 2.0)
+
+        # Step simulation (parent class handles this)
+        try:
+            action_payload = struct.pack('d', 0.0)
+            self.socket.send(action_payload)
+            reply_bytes = self.socket.recv()
+            unpacked = struct.unpack('iI', reply_bytes)
+            self.sim_sec, self.sim_nanosec = unpacked
+        except zmq.error.Again:
+            print("Simulation ZMQ Error: Timeout")
+        except Exception as e:
+            print(f"Simulation ZMQ Error: {e}")
+
+        # Send velocity command to aircraft
+        self._send_velocity_command(vx, vy, vz, yaw_rate)
+
+        self.step_count += 1
+
+        # Simple reward: distance traveled from start
+        reward = self._calculate_reward(action)
+
+        # Check termination
+        terminated = self._check_terminated()
+        truncated = self.step_count >= self.max_steps
+
+        obs = self._get_obs()
+        info = self._get_info()
+        info['action_name'] = self.last_action_name
+
+        if self.render_mode == "ansi":
+            self._render_frame()
+
+        return obs, reward, terminated, truncated, info
+
+    def _calculate_reward(self, action) -> float:
+        """Simple reward: just staying alive and maintaining altitude."""
+        # Altitude maintenance reward
+        altitude_error = abs(self.drone_position[2] - self.takeoff_altitude)
+        altitude_reward = -0.1 * altitude_error
+
+        # Survival bonus
+        survival_bonus = 0.1
+
+        return float(altitude_reward + survival_bonus)
+
+    def _check_terminated(self) -> bool:
+        """Check if episode should terminate."""
+        # Check altitude bounds (ENU: z is up)
+        if self.drone_position[2] < 5.0:
+            print("\nEpisode terminated: Altitude too low (crashed)")
+            return True
+        if self.drone_position[2] > 100.0:
+            print("\nEpisode terminated: Altitude too high")
+            return True
+
+        # Check if too far from start
+        if self.initial_position is not None:
+            distance_from_start = np.linalg.norm(
+                self.drone_position[:2] - self.initial_position[:2]
+            )
+            if distance_from_start > 500.0:
+                print("\nEpisode terminated: Too far from start position")
+                return True
+
+        return False
+
+    def _render_frame(self):
+        """Render current state to terminal."""
+        # Clear line and print status
+        pos = self.drone_position
+        vel = self.drone_velocity
+
+        status = (
+            f"\r[{self.last_action_name:8s}] "
+            f"Pos: ({pos[0]:7.1f}, {pos[1]:7.1f}, {pos[2]:6.1f}) | "
+            f"Vel: ({vel[0]:5.1f}, {vel[1]:5.1f}, {vel[2]:5.1f}) | "
+            f"Step: {self.step_count}"
+        )
+        print(status, end="", flush=True)
+
+    def _get_info(self):
+        """Get info dict with additional simple command info."""
+        info = super()._get_info()
+        info['action'] = self.current_action
+        info['action_name'] = self.last_action_name
+        info['is_flying'] = self.is_flying
+        info['takeoff_altitude'] = self.takeoff_altitude
+        return info
