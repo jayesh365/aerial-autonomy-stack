@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+"""
+Gymnasium Setup Node - Initializes drone for RL training.
+
+This node handles the initial setup sequence:
+1. Wait for autopilot interface to be ready
+2. Send takeoff command
+3. Wait for takeoff to complete and drone to stabilize
+4. Keep running to maintain ROS connections
+
+Based on the mission sequence pattern from test_mission.yaml
+"""
+
 import time
 import argparse
 
@@ -5,101 +18,258 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from autopilot_interface_msgs.action import Takeoff, Offboard
+from nav_msgs.msg import Odometry
+from std_msgs.msg import String
+
+# Try to import MAVROS state for ArduPilot
+try:
+    from mavros_msgs.msg import State as MavrosState
+    MAVROS_AVAILABLE = True
+except ImportError:
+    MAVROS_AVAILABLE = False
 
 
 class GymnasiumSetup(Node):
-    def __init__(self, drone_id):
+    def __init__(self, drone_id, takeoff_altitude=40.0):
         super().__init__('gymnasium_setup_node')
         self.drone_id = drone_id
-        
+        self.takeoff_altitude = takeoff_altitude
+
+        # State tracking
+        self.current_altitude = 0.0
+        self.drone_armed = False
+        self.drone_mode = ""
+        self.mavros_connected = False
+        self.position_valid = False
+
+        # Action clients
         self.takeoff_client = ActionClient(self, Takeoff, f'/Drone{drone_id}/takeoff_action')
         self.offboard_client = ActionClient(self, Offboard, f'/Drone{drone_id}/offboard_action')
 
-    def wait_for_server(self, client, name):
+        # QoS profile for subscribers
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        # Subscribe to odometry to track altitude
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            '/mavros/local_position/odom',
+            self._odom_callback,
+            qos_profile
+        )
+
+        # Subscribe to MAVROS state if available
+        if MAVROS_AVAILABLE:
+            self.state_sub = self.create_subscription(
+                MavrosState,
+                '/mavros/state',
+                self._mavros_state_callback,
+                qos_profile
+            )
+
+        self.get_logger().info(f'GymnasiumSetup initialized for Drone{drone_id}')
+        self.get_logger().info(f'Target takeoff altitude: {takeoff_altitude}m')
+
+    def _odom_callback(self, msg: Odometry):
+        """Track current altitude from odometry."""
+        self.current_altitude = msg.pose.pose.position.z  # ENU: z is up
+        self.position_valid = True
+
+    def _mavros_state_callback(self, msg):
+        """Track MAVROS connection and arm state."""
+        self.mavros_connected = msg.connected
+        self.drone_armed = msg.armed
+        self.drone_mode = msg.mode
+
+    def wait_for_server(self, client, name, timeout=60.0):
+        """Wait for action server with timeout."""
         self.get_logger().info(f'Waiting for {name} action server...')
+        start_time = time.time()
         while not client.wait_for_server(timeout_sec=2.0):
+            if time.time() - start_time > timeout:
+                self.get_logger().error(f'{name} server not available after {timeout}s')
+                return False
             self.get_logger().info(f'{name} not available yet. Retrying...')
         self.get_logger().info(f'{name} server is ready.')
+        return True
+
+    def wait_for_mavros(self, timeout=120.0):
+        """Wait for MAVROS to be connected and publishing data."""
+        self.get_logger().info('Waiting for MAVROS connection...')
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            rclpy.spin_once(self, timeout_sec=0.5)
+
+            if self.position_valid:
+                self.get_logger().info(f'MAVROS connected! Altitude: {self.current_altitude:.1f}m')
+                if MAVROS_AVAILABLE:
+                    self.get_logger().info(f'Armed: {self.drone_armed}, Mode: {self.drone_mode}')
+                return True
+
+            elapsed = int(time.time() - start_time)
+            if elapsed % 10 == 0 and elapsed > 0:
+                self.get_logger().info(f'Still waiting for MAVROS... ({elapsed}s)')
+
+        self.get_logger().warn('Timeout waiting for MAVROS')
+        return False
 
     def send_takeoff(self):
-        self.wait_for_server(self.takeoff_client, 'Takeoff')
-        
+        """Send takeoff command and wait for completion."""
+        if not self.wait_for_server(self.takeoff_client, 'Takeoff'):
+            return False
+
         goal_msg = Takeoff.Goal()
-        goal_msg.takeoff_altitude = 40.0
-        goal_msg.vtol_transition_heading = 330.0
+        goal_msg.takeoff_altitude = self.takeoff_altitude
+        # VTOL parameters (used if aircraft is VTOL)
+        goal_msg.vtol_transition_heading = 300.0
         goal_msg.vtol_loiter_nord = 100.0
         goal_msg.vtol_loiter_east = 100.0
-        goal_msg.vtol_loiter_alt = 60.0
+        goal_msg.vtol_loiter_alt = self.takeoff_altitude + 20.0
 
-        self.get_logger().info('Sending Takeoff Goal...')
-        
-        send_goal_future = self.takeoff_client.send_goal_async(goal_msg)
+        self.get_logger().info(f'Sending Takeoff Goal (altitude: {self.takeoff_altitude}m)...')
+
+        send_goal_future = self.takeoff_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self._takeoff_feedback_callback
+        )
         rclpy.spin_until_future_complete(self, send_goal_future)
         goal_handle = send_goal_future.result()
 
         if not goal_handle.accepted:
-            self.get_logger().error('Takeoff Goal Rejected! Retrying...')
+            self.get_logger().error('Takeoff Goal Rejected!')
             return False
 
         self.get_logger().info('Takeoff Goal Accepted. Waiting for result...')
-        
+
         get_result_future = goal_handle.get_result_async()
         rclpy.spin_until_future_complete(self, get_result_future)
-        
+
+        result = get_result_future.result()
+        self.get_logger().info(f'Takeoff completed! Result: {result}')
+
         return True
 
-    def send_offboard(self):
-        self.wait_for_server(self.offboard_client, 'Offboard')
+    def _takeoff_feedback_callback(self, feedback_msg):
+        """Handle takeoff feedback."""
+        feedback = feedback_msg.feedback
+        self.get_logger().info(f'Takeoff feedback: {feedback}')
 
-        goal_msg = Offboard.Goal()
-        goal_msg.offboard_setpoint_type = 1 # 1 is PX4 rates reference
-        goal_msg.max_duration_sec = 1200.0 # 20' of offboard mode
+    def wait_for_altitude(self, target_altitude, tolerance=2.0, timeout=60.0):
+        """Wait for drone to reach target altitude."""
+        self.get_logger().info(f'Waiting for altitude {target_altitude}m (tolerance: {tolerance}m)...')
+        start_time = time.time()
 
-        self.get_logger().info('Sending Offboard Goal...')
-        send_goal_future = self.offboard_client.send_goal_async(goal_msg)
-        rclpy.spin_until_future_complete(self, send_goal_future)
-        goal_handle = send_goal_future.result()
+        while time.time() - start_time < timeout:
+            rclpy.spin_once(self, timeout_sec=0.2)
 
-        if not goal_handle.accepted:
-            self.get_logger().error('Offboard Goal Rejected.')
+            if self.position_valid:
+                if abs(self.current_altitude - target_altitude) < tolerance:
+                    self.get_logger().info(f'Reached target altitude: {self.current_altitude:.1f}m')
+                    return True
+
+                elapsed = int(time.time() - start_time)
+                if elapsed % 5 == 0 and elapsed > 0:
+                    self.get_logger().info(f'Current altitude: {self.current_altitude:.1f}m, target: {target_altitude}m')
+
+        self.get_logger().warn(f'Timeout waiting for altitude. Current: {self.current_altitude:.1f}m')
+        return False
+
+    def spin_wait(self, seconds):
+        """Wait for specified duration while processing callbacks."""
+        self.get_logger().info(f'Waiting {seconds} seconds for stabilization...')
+        target_time = self.get_clock().now() + Duration(seconds=seconds)
+        while self.get_clock().now() < target_time:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        self.get_logger().info('Wait complete.')
+
+    def run_setup_sequence(self):
+        """Run the complete setup sequence."""
+        self.get_logger().info('='*50)
+        self.get_logger().info('Starting Gymnasium Setup Sequence')
+        self.get_logger().info('='*50)
+
+        # Step 1: Wait for MAVROS to be ready
+        self.get_logger().info('Step 1: Waiting for MAVROS...')
+        if not self.wait_for_mavros(timeout=120.0):
+            self.get_logger().error('Failed to connect to MAVROS')
             return False
-        
-        self.get_logger().info('Offboard Mode Active.')
+
+        # Step 2: Send takeoff command
+        self.get_logger().info('Step 2: Sending takeoff command...')
+        takeoff_success = False
+        max_retries = 3
+        for attempt in range(max_retries):
+            if self.send_takeoff():
+                takeoff_success = True
+                break
+            self.get_logger().warn(f'Takeoff attempt {attempt+1} failed, retrying...')
+            self.spin_wait(2.0)
+
+        if not takeoff_success:
+            self.get_logger().error('Failed to takeoff after multiple attempts')
+            return False
+
+        # Step 3: Wait for drone to reach altitude
+        self.get_logger().info('Step 3: Waiting for target altitude...')
+        self.wait_for_altitude(self.takeoff_altitude, tolerance=3.0, timeout=60.0)
+
+        # Step 4: Stabilization wait (like "wait: 5.0" in mission)
+        self.get_logger().info('Step 4: Stabilization wait...')
+        self.spin_wait(5.0)
+
+        self.get_logger().info('='*50)
+        self.get_logger().info('Setup sequence complete!')
+        self.get_logger().info(f'Drone is at altitude: {self.current_altitude:.1f}m')
+        self.get_logger().info(f'Armed: {self.drone_armed}, Mode: {self.drone_mode}')
+        self.get_logger().info('Ready for gym control commands.')
+        self.get_logger().info('='*50)
+
         return True
 
-def spin_wait(node, seconds):
-    target_time = node.get_clock().now() + Duration(seconds=seconds)
-    while node.get_clock().now() < target_time:
-        rclpy.spin_once(node, timeout_sec=0.1) # Process callbacks to receive /clock updates
 
 def main(args=None):
     rclpy.init(args=args)
-    
+
     parser = argparse.ArgumentParser(description='Gymnasium Setup Node')
     parser.add_argument('--drone_id', type=str, required=True, help='The ID of the drone')
+    parser.add_argument('--takeoff_altitude', type=float, default=40.0, help='Takeoff altitude in meters')
     parsed_args, _ = parser.parse_known_args()
-    drone_id = parsed_args.drone_id
-    
-    node = GymnasiumSetup(drone_id)
 
-    # Takeoff
-    takeoff_success = False
-    while not takeoff_success:
-        takeoff_success = node.send_takeoff()
-        if not takeoff_success:
-            spin_wait(node, 2.0) # Simulation time
+    node = GymnasiumSetup(
+        drone_id=parsed_args.drone_id,
+        takeoff_altitude=parsed_args.takeoff_altitude
+    )
 
-    # # Offboard
-    # offboard_success = False
-    # while not offboard_success:
-    #     offboard_success = node.send_offboard()
-    #     if not offboard_success:
-    #         spin_wait(node, 1.0) # Simulation time
+    # Run setup sequence
+    success = node.run_setup_sequence()
+
+    if success:
+        # Keep the node running to maintain ROS connections
+        # and continue reporting status
+        node.get_logger().info('Keeping node alive for status monitoring...')
+        try:
+            rate = node.create_rate(0.2)  # 0.2 Hz = every 5 seconds
+            while rclpy.ok():
+                rclpy.spin_once(node, timeout_sec=5.0)
+                node.get_logger().info(
+                    f'Status: alt={node.current_altitude:.1f}m, '
+                    f'armed={node.drone_armed}, mode={node.drone_mode}'
+                )
+        except KeyboardInterrupt:
+            pass
+    else:
+        node.get_logger().error('Setup sequence failed!')
 
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
