@@ -311,21 +311,108 @@ Based on your stated goal, here's what we need:
 
 ---
 
-## Questions Before We Code
+## Proposed Architecture (v1)
 
-1. **Control granularity**:
-   - High-level (go to waypoint) or low-level (velocity commands)?
+Based on user requirements:
+- **Control**: High-level waypoints (Option A)
+- **Takeoff**: Auto-takeoff on `reset()`
+- **Observations**: Position, velocity, orientation, camera, lidar
+- **Autopilot**: Support both PX4 and ArduPilot
 
-2. **Observation needs**:
-   - Just position/velocity, or also camera/lidar?
+### Available State Topics (MAVROS)
 
-3. **Takeoff handling**:
-   - Should reset() automatically takeoff and hover?
-   - Or should takeoff be an explicit action?
+| Topic | Message Type | Data | Rate |
+|-------|--------------|------|------|
+| `/mavros/local_position/odom` | Odometry | Position (x,y,z), orientation (quat), velocity | 4Hz |
+| `/mavros/global_position/global` | NavSatFix | GPS lat/lon/alt | 4Hz |
+| `/mavros/vfr_hud` | VfrHud | Heading, airspeed, groundspeed, altitude | 4Hz |
+| `/mavros/state` | State | Armed, mode, connected | 1Hz |
 
-4. **Autopilot**:
-   - PX4 or ArduPilot? (Different control interfaces)
+### Proposed Gym Interface
+
+```python
+# Action Space: target position delta (meters) in local ENU frame
+action_space = Box(low=-10.0, high=10.0, shape=(3,), dtype=float32)
+# action = [dx, dy, dz] - move relative to current position
+
+# Observation Space (without camera/lidar for v1)
+observation_space = Dict({
+    "position": Box(low=-inf, high=inf, shape=(3,)),      # [x, y, z] meters
+    "velocity": Box(low=-inf, high=inf, shape=(3,)),      # [vx, vy, vz] m/s
+    "orientation": Box(low=-1, high=1, shape=(4,)),       # quaternion [x,y,z,w]
+    "heading": Box(low=0, high=360, shape=(1,)),          # degrees
+})
+```
+
+### Proposed Data Flow
+
+```
+┌──────────────────┐                     ┌─────────────────────────────────────────┐
+│    aas_env.py    │                     │         SIMULATION CONTAINER            │
+│    (Python)      │                     │                                         │
+│                  │  ZMQ TCP:5555       │  ┌──────────────────────────────────┐   │
+│  reset()        ─┼────────────────────►│  │     zeromq_bridge (modified)     │   │
+│   action=RESET   │                     │  │                                  │   │
+│                  │  [state_data]       │  │  1. Call takeoff_action          │   │
+│  ◄───────────────┼─────────────────────┼──┤  2. Wait for hover               │   │
+│                  │                     │  │  3. Return initial state         │   │
+│                  │                     │  └──────────────────────────────────┘   │
+│  step([dx,dy,dz])┼────────────────────►│  ┌──────────────────────────────────┐   │
+│                  │                     │  │     zeromq_bridge (modified)     │   │
+│                  │  [state_data]       │  │                                  │   │
+│  ◄───────────────┼─────────────────────┼──┤  1. Call set_reposition service  │   │
+│                  │                     │  │  2. Step Gazebo                  │   │
+└──────────────────┘                     │  │  3. Read state from MAVROS       │   │
+                                         │  │  4. Return state                 │   │
+                                         │  └──────────────────────────────────┘   │
+                                         │                    │                    │
+                                         │                    ▼                    │
+                                         │  ┌──────────────────────────────────┐   │
+                                         │  │     autopilot_interface          │   │
+                                         │  │     (existing, unchanged)        │   │
+                                         │  │                                  │   │
+                                         │  │  - /DroneN/takeoff_action        │   │
+                                         │  │  - /DroneN/set_reposition        │   │
+                                         │  └──────────────────────────────────┘   │
+                                         └─────────────────────────────────────────┘
+```
+
+### Implementation Tasks
+
+1. **Modify `zeromq_bridge.cpp`**:
+   - Add ROS2 action client for `takeoff_action`
+   - Add ROS2 service client for `set_reposition`
+   - Subscribe to MAVROS state topics
+   - Change message format: receive `[command_type, dx, dy, dz]`, return `[pos, vel, orient, heading]`
+
+2. **Modify `aas_env.py`**:
+   - Update action space to `Box(shape=(3,))` for `[dx, dy, dz]`
+   - Update observation space to include position, velocity, orientation, heading
+   - Update `step()` to pack/unpack new message format
+   - Update `reset()` to wait for takeoff completion
+
+3. **Create simplified mission YAML** (or disable mission node):
+   - Don't run the full mission during init
+   - Let the gym control takeoff timing
+
+### Open Questions
+
+1. **Coordinate frame**:
+   - Use local ENU (East-North-Up) or body frame?
+   - ENU is simpler for waypoints
+
+2. **Action interpretation**:
+   - Absolute position `[x, y, z]` or delta `[dx, dy, dz]`?
+   - Delta is more natural for RL (agent learns "move forward 2m")
+
+3. **Step timing**:
+   - How long to wait after `set_reposition` before returning state?
+   - Should we wait until drone reaches target, or just step simulation N times?
+
+4. **Camera/Lidar**:
+   - Add later as separate observation channels
+   - Need to handle image data over ZMQ (larger messages)
 
 ---
 
-*Last updated: After code analysis - identified the gap*
+*Last updated: Proposed architecture v1*
