@@ -12,6 +12,11 @@ import concurrent.futures
 from docker.types import NetworkingConfig, EndpointConfig, DeviceRequest
 
 
+# Command types for ZMQ protocol
+CMD_RESET = 0
+CMD_STEP = 1
+
+
 class AASEnv(gym.Env):
     metadata = {"render_modes": ["human", "ansi"]}
 
@@ -29,26 +34,31 @@ class AASEnv(gym.Env):
         self.GYM_FREQ_HZ = gym_freq_hz
         self.GYM_INIT_DURATION = 80.0  # Seconds to run unpaused during reset (seconds)
         self.MAX_EPISODE_LENGTH_SEC = 300.0  # Max episode length in seconds (excluding init duration)
-        
-        # [DUMMY] Action Space: [/action] between -1.0 and 1.0
+
+        # Action Space: position delta [dx, dy, dz] in meters (ENU frame)
         self.action_space = gym.spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(1,), dtype=np.float32
+            low=-10.0,
+            high=10.0,
+            shape=(3,), dtype=np.float32
         )
-        # [DUMMY] Observation Space is the Gazebo Sim /clocl [seconds, nanoseconds]
-        self.observation_space = gym.spaces.Box(
-            low=np.array([0.0, 0.0], dtype=np.float64),
-            high=np.array([np.inf, 1e9], dtype=np.float64),
-            dtype=np.float64
-        )
-        # Initialize storage for the clock
-        self.sim_sec = 0.0
-        self.sim_nanosec = 0.0
+
+        # Observation Space: drone state
+        self.observation_space = gym.spaces.Dict({
+            "position": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float64),
+            "velocity": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float64),
+            "orientation": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float64),
+            "heading": gym.spaces.Box(low=0.0, high=360.0, shape=(1,), dtype=np.float64),
+        })
+
+        # Initialize storage for state
+        self.position = np.zeros(3, dtype=np.float64)
+        self.velocity = np.zeros(3, dtype=np.float64)
+        self.orientation = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)  # quaternion [x,y,z,w]
+        self.heading = np.array([0.0], dtype=np.float64)
 
         self.max_steps = int(self.MAX_EPISODE_LENGTH_SEC*self.GYM_FREQ_HZ)  # Max steps per episode
         self.step_count = 0
-        
+
         # Rendering
         self.render_mode = render_mode
 
@@ -205,7 +215,7 @@ class AASEnv(gym.Env):
         # self.simulation_container.start()
         #
         self.aircraft_containers = []
-        for i in range(1, self.NUM_QUADS + self.NUM_VTOLS + 1):            
+        for i in range(1, self.NUM_QUADS + self.NUM_VTOLS + 1):
             air_cont_name = f"aircraft-container-inst{self.INSTANCE}_{i}"
             force_container_cleanup(air_cont_name)
             print(f"Creating Aircraft Container {air_cont_name}...")
@@ -265,10 +275,37 @@ class AASEnv(gym.Env):
             self.ZMQ_IP = f"{self.SIM_SUBNET}.90.{self.SIM_ID}"
 
     def _get_obs(self):
-        return np.array([self.sim_sec, self.sim_nanosec], dtype=np.float64)
+        return {
+            "position": self.position.copy(),
+            "velocity": self.velocity.copy(),
+            "orientation": self.orientation.copy(),
+            "heading": self.heading.copy(),
+        }
 
     def _get_info(self):
-        return {"sim_time_sec": self.sim_sec, "sim_time_nanosec": self.sim_nanosec}
+        return {
+            "position": self.position.tolist(),
+            "velocity": self.velocity.tolist(),
+            "heading": float(self.heading[0]),
+        }
+
+    def _unpack_state(self, reply_bytes):
+        """Unpack state from ZMQ reply: 11 doubles (88 bytes)."""
+        if len(reply_bytes) != 88:
+            print(f"Warning: Expected 88 bytes, got {len(reply_bytes)}")
+            return
+        unpacked = struct.unpack('11d', reply_bytes)
+        self.position[0] = unpacked[0]  # x
+        self.position[1] = unpacked[1]  # y
+        self.position[2] = unpacked[2]  # z
+        self.velocity[0] = unpacked[3]  # vx
+        self.velocity[1] = unpacked[4]  # vy
+        self.velocity[2] = unpacked[5]  # vz
+        self.orientation[0] = unpacked[6]  # qx
+        self.orientation[1] = unpacked[7]  # qy
+        self.orientation[2] = unpacked[8]  # qz
+        self.orientation[3] = unpacked[9]  # qw
+        self.heading[0] = unpacked[10]  # heading
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)  # Handle seeding
@@ -305,49 +342,46 @@ class AASEnv(gym.Env):
         ###########################################################################################
         try:
             self.socket.setsockopt(zmq.RCVTIMEO, 300 * 1000) # Temporarily increase timeout to 300s to reset the simulation
-            reset = 9999.0 # A special action to reset the environment
-            action_payload = struct.pack('d', reset) # Serialize the action 
+            # Pack reset command: [cmd_type (uint8), dx, dy, dz (3 doubles)]
+            action_payload = struct.pack('B3d', CMD_RESET, 0.0, 0.0, 0.0)
             self.socket.send(action_payload) # Send the REQ
-            reply_bytes = self.socket.recv() # Wait for the REP (synchronous block) this call will block until a reply is received or it times out
+            reply_bytes = self.socket.recv() # Wait for the REP (synchronous block)
             self.socket.setsockopt(zmq.RCVTIMEO, 60 * 1000) # Restore standard timeout (60s) for stepping
-            unpacked = struct.unpack('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
-            self.sim_sec, self.sim_nanosec = unpacked
-            self.start_sim_sec = float(self.sim_sec) + (float(self.sim_nanosec) * 1e-9)
+            self._unpack_state(reply_bytes)
         except zmq.error.Again:
             print("ZMQ Error: Reply from container timed out.")
-        except ValueError:
-            print("ZMQ Error: Reply format error. Received garbage state.")
+        except ValueError as e:
+            print(f"ZMQ Error: Reply format error. {e}")
         ###########################################################################################
         ###########################################################################################
         ###########################################################################################
         self.step_count = 0
-        
+
         if self.render_mode == "ansi":
             self._render_frame()
 
         return self._get_obs(), self._get_info()
 
     def step(self, action):
-        force = action[0]
+        dx, dy, dz = float(action[0]), float(action[1]), float(action[2])
         ###########################################################################################
         # ZeroMQ REQ/REP to the ROS2 sim ##########################################################
         ###########################################################################################
         try:
-            action_payload = struct.pack('d', force) # Serialize the action
+            # Pack step command: [cmd_type (uint8), dx, dy, dz (3 doubles)]
+            action_payload = struct.pack('B3d', CMD_STEP, dx, dy, dz)
             self.socket.send(action_payload) # Send the REQ
-            reply_bytes = self.socket.recv() # Wait for the REP (synchronous block) this call will block until a reply is received or it times out
-            unpacked = struct.unpack('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
-            sec, nanosec = unpacked
-            self.sim_sec, self.sim_nanosec = unpacked
+            reply_bytes = self.socket.recv() # Wait for the REP (synchronous block)
+            self._unpack_state(reply_bytes)
         except zmq.error.Again:
             print("ZMQ Error: Reply from container timed out.")
-        except ValueError:
-            print("ZMQ Error: Reply format error. Received garbage state.")
+        except ValueError as e:
+            print(f"ZMQ Error: Reply format error. {e}")
         ###########################################################################################
         ###########################################################################################
         ###########################################################################################
         self.step_count += 1
-        # Calculate reward
+        # Calculate reward (placeholder - user should define based on task)
         reward = float(-1.0)
         # Check for termination
         terminated = False  # This is a continuing task, never "terminates"
@@ -356,7 +390,7 @@ class AASEnv(gym.Env):
         # Get obs and info
         obs = self._get_obs()
         info = self._get_info()
-        
+
         # Handle rendering
         if self.render_mode == "ansi":
             self._render_frame()
@@ -368,19 +402,17 @@ class AASEnv(gym.Env):
             self._render_frame()
 
     def _render_frame(self):
-        bar_width = 40        
-        current_abs_time = self.sim_sec + (self.sim_nanosec * 1e-9)
-        start_time = getattr(self, 'start_sim_sec', 0.0)
-        episode_time = current_abs_time - start_time
-        progress = min(max(episode_time / self.MAX_EPISODE_LENGTH_SEC, 0.0), 1.0)
+        bar_width = 40
+        progress = min(max(self.step_count / self.max_steps, 0.0), 1.0)
         filled_len = int(bar_width * progress)
         bar = '=' * filled_len + '-' * (bar_width - filled_len)
-        print(f"\r[{bar}] {episode_time:6.2f}s / {self.MAX_EPISODE_LENGTH_SEC:.0f}s", end="")
+        pos_str = f"pos=[{self.position[0]:6.1f}, {self.position[1]:6.1f}, {self.position[2]:6.1f}]"
+        print(f"\r[{bar}] step {self.step_count:5d}/{self.max_steps} {pos_str}", end="")
 
     def close(self):
         if self.render_mode == "ansi":
             print() # Add a newline after the final render
-        
+
         try:
             self.simulation_container.stop()
             self.simulation_container.remove(force=True)

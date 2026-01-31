@@ -16,6 +16,7 @@ setup(
     entry_points={
         'console_scripts': [
             'mission = mission.mission_node:main',
+            'gym_control = mission.gym_control_node:main',
         ],
     },
 )

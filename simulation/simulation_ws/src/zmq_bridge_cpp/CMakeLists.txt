@@ -9,6 +9,8 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(rosgraph_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
 # Find Gazebo Dependencies
 find_package(gz-transport13 REQUIRED)
@@ -20,11 +22,13 @@ pkg_check_modules(ZMQ REQUIRED libzmq)
 
 add_executable(zmq_bridge_node src/zeromq_bridge.cpp)
 
-# Use ament_target_dependencies for ROS packages. 
+# Use ament_target_dependencies for ROS packages.
 ament_target_dependencies(zmq_bridge_node
   rclcpp
   std_msgs
   rosgraph_msgs
+  nav_msgs
+  geometry_msgs
 )
 
 # Manually link non-ROS system libraries (Gazebo & ZMQ)
