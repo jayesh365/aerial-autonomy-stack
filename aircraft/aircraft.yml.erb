@@ -90,4 +90,5 @@ windows:
       layout: even-horizontal
       panes:
         - python3 /aas/aircraft_resources/scripts/gymnasium_setup.py --drone_id <%= drone_id %> <%= simulated_time ? '--ros-args -p use_sim_time:=true' : '' %>
+        - ros2 run mission gym_control --ros-args -r __ns:=/Drone<%= drone_id %> <%= simulated_time ? '-p use_sim_time:=true' : '' %>
   <% end %>
