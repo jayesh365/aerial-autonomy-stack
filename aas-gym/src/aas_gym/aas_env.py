@@ -324,11 +324,31 @@ class AASEnv(gym.Env):
         except Exception as e:
             print(f"Error restarting containers: {e}")
             raise e
-        # Establish ZeroMQ connection
-        self.socket = self.zmq_context.socket(zmq.REQ)
-        self.socket.setsockopt(zmq.RCVTIMEO, 60 * 1000)  # 60 seconds timeout
+
+        # Wait for services to start inside containers
+        print("Waiting for container services to initialize...")
+        time.sleep(10)  # Give containers time to start their services
+
+        # Establish ZeroMQ connection with retry logic
+        max_retries = 30
+        retry_delay = 2.0
+        for attempt in range(max_retries):
+            try:
+                self.socket = self.zmq_context.socket(zmq.REQ)
+                self.socket.setsockopt(zmq.RCVTIMEO, 10 * 1000)  # 10 sec timeout for connection test
+                self.socket.setsockopt(zmq.LINGER, 0)  # Don't block on close
+                if self.ZMQ_TRANSPORT == "tcp":
+                    self.socket.connect(f"tcp://{self.ZMQ_IP}:{self.ZMQ_PORT}")
+                    print(f"ZeroMQ attempting connection to {self.ZMQ_IP}:{self.ZMQ_PORT} (attempt {attempt+1}/{max_retries})")
+                break
+            except Exception as e:
+                print(f"Connection attempt {attempt+1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    raise RuntimeError(f"Failed to connect to ZMQ bridge after {max_retries} attempts")
+
         if self.ZMQ_TRANSPORT == "tcp":
-            self.socket.connect(f"tcp://{self.ZMQ_IP}:{self.ZMQ_PORT}")
             print(f"ZeroMQ socket connected to {self.ZMQ_IP}:{self.ZMQ_PORT}")
         elif self.ZMQ_TRANSPORT == "ipc":
             ipc_file = f"{self.ZMQ_IPC_SOCKET_DIR}/bridge_inst{self.INSTANCE}.ipc"
