@@ -345,8 +345,8 @@ class AASEnv(gym.Env):
             self.socket.setsockopt(zmq.RCVTIMEO, 300 * 1000)  # 300 seconds for reset
 
             # Pack reset command: [cmd_type (uint8), dx, dy, dz (3 doubles)]
-            # Use '=' prefix for native byte order without padding (matches #pragma pack(1) in C++)
             action_payload = struct.pack('=B3d', CMD_RESET, 0.0, 0.0, 0.0)
+
             self.socket.send(action_payload)
             reply_bytes = self.socket.recv()
 
@@ -379,13 +379,21 @@ class AASEnv(gym.Env):
         ###########################################################################################
         try:
             # Pack step command: [cmd_type (uint8), dx, dy, dz (3 doubles)]
-            # Use '=' prefix for native byte order without padding (matches #pragma pack(1) in C++)
             action_payload = struct.pack('=B3d', CMD_STEP, dx, dy, dz)
             self.socket.send(action_payload)
             reply_bytes = self.socket.recv()
 
             # Unpack the state from the reply
             self._unpack_state(reply_bytes)
+
+            print(f"Step action sent: dx={dx:.2f}, dy={dy:.2f}, dz={dz:.2f}")
+
+            # print the reply for debugging
+            # convert reply_bytes to a list of doubles
+            reply_doubles = struct.unpack('11d', reply_bytes)
+            print(f"Received reply: {reply_doubles}")
+            # print(f"Received reply ({len(reply_bytes)} bytes): {reply_bytes}")
+
 
         except zmq.error.Again:
             print("ZMQ Error: Reply from container timed out.")
