@@ -79,9 +79,11 @@ public:
             "/clock", 10,
             std::bind(&ZMQBridge::clock_callback, this, std::placeholders::_1));
 
-        // Subscribe to odometry for state
+        // Subscribe to odometry for state (MAVROS publishes with BEST_EFFORT QoS)
+        rclcpp::QoS odom_qos(10);
+        odom_qos.best_effort();
         odom_subscription_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/mavros/local_position/odom", 10,
+            "/mavros/local_position/odom", odom_qos,
             std::bind(&ZMQBridge::odom_callback, this, std::placeholders::_1));
 
         const char* env_world = std::getenv("WORLD");

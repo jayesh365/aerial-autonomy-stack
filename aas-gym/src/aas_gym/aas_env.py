@@ -345,7 +345,8 @@ class AASEnv(gym.Env):
             self.socket.setsockopt(zmq.RCVTIMEO, 300 * 1000)  # 300 seconds for reset
 
             # Pack reset command: [cmd_type (uint8), dx, dy, dz (3 doubles)]
-            action_payload = struct.pack('B3d', CMD_RESET, 0.0, 0.0, 0.0)
+            # Use '=' prefix for native byte order without padding (matches #pragma pack(1) in C++)
+            action_payload = struct.pack('=B3d', CMD_RESET, 0.0, 0.0, 0.0)
             self.socket.send(action_payload)
             reply_bytes = self.socket.recv()
 
@@ -378,7 +379,8 @@ class AASEnv(gym.Env):
         ###########################################################################################
         try:
             # Pack step command: [cmd_type (uint8), dx, dy, dz (3 doubles)]
-            action_payload = struct.pack('B3d', CMD_STEP, dx, dy, dz)
+            # Use '=' prefix for native byte order without padding (matches #pragma pack(1) in C++)
+            action_payload = struct.pack('=B3d', CMD_STEP, dx, dy, dz)
             self.socket.send(action_payload)
             reply_bytes = self.socket.recv()
 
