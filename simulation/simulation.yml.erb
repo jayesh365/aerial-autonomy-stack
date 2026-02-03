@@ -186,8 +186,13 @@ windows:
         <% end %>
 
   <% if gymnasium %>
+  <% gym_bridge = ENV.fetch('GYM_BRIDGE', 'python') %>
   - zmq_bridge:
       layout: even-horizontal
       panes:
+        <% if gym_bridge == 'cpp' %>
         - ROS_DOMAIN_ID=1 ros2 run zmq_bridge_cpp zmq_bridge_node --ros-args -p use_sim_time:=true -p init_duration:=<%= gym_init_duration %> -p step_size:=<%= gym_step_size %> -p physics_dt:=<%= physics_dt %>
+        <% else %>
+        - ROS_DOMAIN_ID=1 ros2 run zmq_bridge_py zmq_bridge --ros-args -p use_sim_time:=true -p init_duration:=<%= gym_init_duration %> -p step_size:=<%= gym_step_size %> -p physics_dt:=<%= physics_dt %> -p enable_camera:=true
+        <% end %>
   <% end %>

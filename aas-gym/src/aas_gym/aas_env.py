@@ -8,6 +8,7 @@ import os
 import subprocess
 import shutil
 import concurrent.futures
+import cv2
 
 from docker.types import NetworkingConfig, EndpointConfig, DeviceRequest
 
@@ -24,29 +25,37 @@ class AASEnv(gym.Env):
             camera: bool=True,
             lidar: bool=True,
             num_quads: int=1,
-            render_mode=None
+            render_mode=None,
+            enable_camera_obs: bool=False,  # Include camera images in observations
+            camera_shape: tuple=(240, 320, 3)  # H, W, C - matches sensor_camera model.sdf
         ):
         super().__init__()
 
         self.GYM_FREQ_HZ = gym_freq_hz
         self.GYM_INIT_DURATION = 80.0  # Seconds to run unpaused during reset (seconds)
         self.MAX_EPISODE_LENGTH_SEC = 300.0  # Max episode length in seconds (excluding init duration)
+        self.ENABLE_CAMERA_OBS = enable_camera_obs
+        self.CAMERA_SHAPE = camera_shape
 
         self.position = np.zeros(3, dtype=np.float64)
         self.velocity = np.zeros(3, dtype=np.float64)
         self.orientation = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
         self.heading = np.array([0.0], dtype=np.float64)
+        self.camera_image = np.zeros(camera_shape, dtype=np.uint8)
 
         # Action Space: position delta [dx, dy, dz] in meters (ENU frame)
         self.action_space = gym.spaces.Box(low=-10.0, high=10.0, shape=(3,), dtype=np.float32)
 
-        # Observation Space: drone state
-        self.observation_space = gym.spaces.Dict({
+        # Observation Space: drone state (+ optional camera)
+        obs_dict = {
             "position": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float64),
             "velocity": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float64),
             "orientation": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float64),
             "heading": gym.spaces.Box(low=0.0, high=360.0, shape=(1,), dtype=np.float64),
-        })
+        }
+        if enable_camera_obs:
+            obs_dict["image"] = gym.spaces.Box(low=0, high=255, shape=camera_shape, dtype=np.uint8)
+        self.observation_space = gym.spaces.Dict(obs_dict)
 
         self.max_steps = int(self.MAX_EPISODE_LENGTH_SEC*self.GYM_FREQ_HZ)  # Max steps per episode
         self.step_count = 0
@@ -267,12 +276,15 @@ class AASEnv(gym.Env):
             self.ZMQ_IP = f"{self.SIM_SUBNET}.90.{self.SIM_ID}"
 
     def _get_obs(self):
-        return {
+        obs = {
             "position": self.position.copy(),
             "velocity": self.velocity.copy(),
             "orientation": self.orientation.copy(),
             "heading": self.heading.copy(),
         }
+        if self.ENABLE_CAMERA_OBS:
+            obs["image"] = self.camera_image.copy()
+        return obs
 
     def _get_info(self):
         return {
@@ -282,18 +294,22 @@ class AASEnv(gym.Env):
         }
 
     def _unpack_state(self, reply_bytes):
-        """Unpack state from ZMQ reply: 11 doubles (88 bytes).
+        """Unpack state from ZMQ reply.
 
-        StatePayload from zeromq_bridge.cpp:
-        - x, y, z (position in ENU frame)
-        - vx, vy, vz (velocity)
-        - qx, qy, qz, qw (orientation quaternion)
-        - heading (degrees, 0-360)
+        Format (Python bridge with camera):
+        - 88 bytes: state (11 doubles: x,y,z, vx,vy,vz, qx,qy,qz,qw, heading)
+        - 4 bytes: image size (uint32)
+        - N bytes: JPEG image data
+
+        Format (C++ bridge, no camera):
+        - 88 bytes: state only
         """
-        if len(reply_bytes) != 88:
-            print(f"Warning: Expected 88 bytes, got {len(reply_bytes)}")
+        if len(reply_bytes) < 88:
+            print(f"Warning: Expected at least 88 bytes, got {len(reply_bytes)}")
             return
-        unpacked = struct.unpack('11d', reply_bytes)
+
+        # Unpack state (first 88 bytes)
+        unpacked = struct.unpack('=11d', reply_bytes[:88])
         self.position[0] = unpacked[0]  # x (east)
         self.position[1] = unpacked[1]  # y (north)
         self.position[2] = unpacked[2]  # z (up)
@@ -305,6 +321,20 @@ class AASEnv(gym.Env):
         self.orientation[2] = unpacked[8]  # qz
         self.orientation[3] = unpacked[9]  # qw
         self.heading[0] = unpacked[10]  # heading in degrees
+
+        # Unpack image if present and camera is enabled
+        if self.ENABLE_CAMERA_OBS and len(reply_bytes) > 92:
+            img_size = struct.unpack('=I', reply_bytes[88:92])[0]
+            if img_size > 0 and len(reply_bytes) >= 92 + img_size:
+                img_data = reply_bytes[92:92 + img_size]
+                # Decode JPEG
+                img_array = np.frombuffer(img_data, dtype=np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                if img is not None:
+                    # Resize if necessary
+                    if img.shape != self.CAMERA_SHAPE:
+                        img = cv2.resize(img, (self.CAMERA_SHAPE[1], self.CAMERA_SHAPE[0]))
+                    self.camera_image = img
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)  # Handle seeding
