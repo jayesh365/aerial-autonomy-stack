@@ -32,7 +32,7 @@ def main():
     if args.mode == "step":
         env = gym.make(
             "AASEnv-v0",
-            gym_freq_hz=1,
+            gym_freq_hz=50,
             autopilot=args.autopilot,
             camera=args.camera,
             lidar=args.lidar,
@@ -41,18 +41,66 @@ def main():
         )
         obs, info = env.reset()
         print(f"Reset result -- Obs: {obs}")
+        print(f"Current position: {obs['position']}")
+
+        step_count = 0
         for i in itertools.count():
-            user_input = input("Press Enter to step, 'r' then Enter to reset, 'q' then Enter to exit...")
+            user_input = input("\nEnter target 'x y z' (absolute), 'r' to reset, 'q' to quit: ")
             stripped_input = user_input.strip().lower()
-            if stripped_input and stripped_input in ('q', 'quit'):
+
+            if stripped_input in ('q', 'quit'):
                 break
-            if stripped_input and stripped_input in ('r', 'reset'):
+            if stripped_input in ('r', 'reset'):
                 obs, info = env.reset()
-                print(f"\nReset result -- Obs: {obs}")
+                step_count = 0
+                print(f"\nReset result -- Position: {obs['position']}")
+                continue
+
+            # Parse target coordinates
+            try:
+                coords = list(map(float, stripped_input.split()))
+                if len(coords) != 3:
+                    print("Please enter 3 coordinates (x y z)")
+                    continue
+                target = np.array(coords)
+            except ValueError:
+                print("Invalid input. Enter 3 space-separated numbers.")
+                continue
+
+            print(f"\nMoving to target: {target}")
+
+            # Move towards target until within tolerance
+            tolerance = 1.0  # meters
+            max_step_size = 2.0  # max delta per step
+            max_steps = 500  # safety limit
+
+            for step in range(max_steps):
+                current_pos = obs['position']
+                delta = target - current_pos
+                distance = np.linalg.norm(delta)
+
+                if distance < tolerance:
+                    print(f"\n✓ Reached target! Final position: {current_pos}, Distance: {distance:.2f}m")
+                    break
+
+                # Proportional control - move towards target, capped at max_step_size
+                if distance > max_step_size:
+                    action = (delta / distance) * max_step_size
+                else:
+                    action = delta
+
+                obs, reward, terminated, truncated, info = env.step(action.astype(np.float32))
+                step_count += 1
+
+                # Progress display
+                print(f"\r  Step {step_count}: pos=[{current_pos[0]:7.2f}, {current_pos[1]:7.2f}, {current_pos[2]:7.2f}] -> target, dist={distance:6.2f}m", end="")
+
+                if terminated or truncated:
+                    print(f"\nEpisode ended (terminated={terminated}, truncated={truncated})")
+                    break
             else:
-                rnd_action = env.action_space.sample()
-                obs, reward, terminated, truncated, info = env.step(rnd_action)
-                print(f"\nStep {i} -- action: {rnd_action} result -- Obs: {obs}, Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}")
+                print(f"\nMax steps reached. Current position: {obs['position']}")
+
         print("\nClosing environment.")
         env.close()
 
