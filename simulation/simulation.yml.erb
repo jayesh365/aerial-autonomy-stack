@@ -189,5 +189,5 @@ windows:
   - zmq_bridge:
       layout: even-horizontal
       panes:
-        - ros2 run zmq_bridge_cpp zmq_bridge_node --ros-args -p init_duration:=<%= gym_init_duration %> -p step_size:=<%= gym_step_size %> -p physics_dt:=<%= physics_dt %>
+        - ros2 run zmq_bridge_py zmq_bridge_node --ros-args -p init_duration:=<%= gym_init_duration %> -p step_size:=<%= gym_step_size %> -p physics_dt:=<%= physics_dt %>
   <% end %>
