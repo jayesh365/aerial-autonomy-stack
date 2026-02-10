@@ -68,8 +68,13 @@ class YoloInferenceNode(Node):
         
         # Create publishers
         self.detection_publisher = self.create_publisher(Detection2DArray, 'detections', 10)
-        self.frame_publisher = self.create_publisher(Image, 'yolo_frame', 1)
         self.bridge = CvBridge()
+
+        # Frame saving to shared volume (host-accessible at /tmp/aas_zmq_sockets/)
+        self.frame_save_dir = '/tmp/aas_zmq_sockets'
+        os.makedirs(self.frame_save_dir, exist_ok=True)
+        self.frame_path = os.path.join(self.frame_save_dir, 'yolo_frame.jpg')
+        self.frame_tmp_path = os.path.join(self.frame_save_dir, '.yolo_frame_tmp.jpg')
 
         # Pre-allocate reusable arrays for scaling to avoid allocation in hot loops
         self.scale_factors = np.zeros(4, dtype=np.float32)
@@ -174,8 +179,9 @@ class YoloInferenceNode(Node):
             if len(boxes) > 0:
                 self.publish_detections(frame.shape, boxes, confidences, class_ids)
 
-            # Publish raw frame (before bounding boxes are drawn)
-            self.frame_publisher.publish(self.bridge.cv2_to_imgmsg(frame, "bgr8"))
+            # Save raw frame (before bounding boxes are drawn) to shared volume
+            cv2.imwrite(self.frame_tmp_path, frame)
+            os.replace(self.frame_tmp_path, self.frame_path)  # Atomic rename
 
             # Visualize
             if not self.headless:

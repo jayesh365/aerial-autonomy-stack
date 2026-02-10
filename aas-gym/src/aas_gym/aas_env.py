@@ -1,6 +1,5 @@
 import numpy as np
 import gymnasium as gym
-import cv2
 import docker
 import zmq
 import time
@@ -307,18 +306,17 @@ class AASEnv(gym.Env):
         try:
             self.socket.setsockopt(zmq.RCVTIMEO, 300 * 1000) # Temporarily increase timeout to 300s to reset the simulation
             reset = 9999.0 # A special action to reset the environment
-            action_payload = struct.pack('d', reset) # Serialize the action
+            action_payload = struct.pack('d', reset) # Serialize the action 
             self.socket.send(action_payload) # Send the REQ
             reply_bytes = self.socket.recv() # Wait for the REP (synchronous block) this call will block until a reply is received or it times out
             self.socket.setsockopt(zmq.RCVTIMEO, 60 * 1000) # Restore standard timeout (60s) for stepping
-            if len(reply_bytes) < 8:
-                print(f"ZMQ Error: Expected 8 bytes, got {len(reply_bytes)}")
-            else:
-                unpacked = struct.unpack_from('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
-                self.sim_sec, self.sim_nanosec = unpacked
-                self.start_sim_sec = float(self.sim_sec) + (float(self.sim_nanosec) * 1e-9)
+            unpacked = struct.unpack('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
+            self.sim_sec, self.sim_nanosec = unpacked
+            self.start_sim_sec = float(self.sim_sec) + (float(self.sim_nanosec) * 1e-9)
         except zmq.error.Again:
             print("ZMQ Error: Reply from container timed out.")
+        except ValueError:
+            print("ZMQ Error: Reply format error. Received garbage state.")
         ###########################################################################################
         ###########################################################################################
         ###########################################################################################
@@ -338,13 +336,13 @@ class AASEnv(gym.Env):
             action_payload = struct.pack('d', force) # Serialize the action
             self.socket.send(action_payload) # Send the REQ
             reply_bytes = self.socket.recv() # Wait for the REP (synchronous block) this call will block until a reply is received or it times out
-            if len(reply_bytes) >= 8:
-                unpacked = struct.unpack_from('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
-                self.sim_sec, self.sim_nanosec = unpacked
-            else:
-                print(f"ZMQ Error: Expected 8 bytes, got {len(reply_bytes)}")
+            unpacked = struct.unpack('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
+            sec, nanosec = unpacked
+            self.sim_sec, self.sim_nanosec = unpacked
         except zmq.error.Again:
             print("ZMQ Error: Reply from container timed out.")
+        except ValueError:
+            print("ZMQ Error: Reply format error. Received garbage state.")
         ###########################################################################################
         ###########################################################################################
         ###########################################################################################
@@ -508,9 +506,6 @@ class AASVelocityEnv(AASEnv):
         self.drone_velocity = np.zeros(3)
         self.drone_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion
 
-        # Latest camera frame from YOLO (BGR numpy array, None if unavailable)
-        self.latest_frame = None
-
         # Aircraft ZMQ setup (separate from simulation ZMQ)
         self.aircraft_zmq_port = 5556  # Port for gym_control_node.py
         self.aircraft_socket = None
@@ -531,8 +526,7 @@ class AASVelocityEnv(AASEnv):
             "position": self.drone_position.copy(),
             "velocity": self.drone_velocity.copy(),
             "orientation": self.drone_orientation.copy(),
-            "distance_to_target": np.linalg.norm(self.drone_position - self.target_position),
-            "frame": self.latest_frame,
+            "distance_to_target": np.linalg.norm(self.drone_position - self.target_position)
         }
 
     def _connect_aircraft_zmq(self):
@@ -569,26 +563,14 @@ class AASVelocityEnv(AASEnv):
             action_payload = struct.pack(self.ACTION_FORMAT, vx, vy, vz, yaw_rate)
             self.aircraft_socket.send(action_payload)
 
-            # Receive state + optional frame
-            # Format: [10 doubles (80B)] + [uint32 frame_len (4B)] + [frame JPEG bytes]
+            # Receive state
             reply_bytes = self.aircraft_socket.recv()
 
-            if len(reply_bytes) >= self.STATE_SIZE:
-                state = struct.unpack(self.STATE_FORMAT, reply_bytes[:self.STATE_SIZE])
+            if len(reply_bytes) == self.STATE_SIZE:
+                state = struct.unpack(self.STATE_FORMAT, reply_bytes)
                 self.drone_position = np.array(state[0:3])
                 self.drone_velocity = np.array(state[3:6])
                 self.drone_orientation = np.array(state[6:10])
-
-                # Parse frame if present
-                frame_header_offset = self.STATE_SIZE
-                if len(reply_bytes) >= frame_header_offset + 4:
-                    frame_len = struct.unpack('I', reply_bytes[frame_header_offset:frame_header_offset + 4])[0]
-                    if frame_len > 0:
-                        jpeg_data = reply_bytes[frame_header_offset + 4:frame_header_offset + 4 + frame_len]
-                        self.latest_frame = cv2.imdecode(
-                            np.frombuffer(jpeg_data, dtype=np.uint8), cv2.IMREAD_COLOR
-                        )
-
                 return True
             else:
                 print(f"Warning: Invalid state size received: {len(reply_bytes)}")
@@ -680,11 +662,8 @@ class AASVelocityEnv(AASEnv):
             action_payload = struct.pack('d', 0.0)  # Dummy action for simulation stepping
             self.socket.send(action_payload)
             reply_bytes = self.socket.recv()
-            if len(reply_bytes) >= 8:
-                unpacked = struct.unpack_from('iI', reply_bytes)
-                self.sim_sec, self.sim_nanosec = unpacked
-            else:
-                print(f"Simulation ZMQ Error: Expected 8 bytes, got {len(reply_bytes)}")
+            unpacked = struct.unpack('iI', reply_bytes)
+            self.sim_sec, self.sim_nanosec = unpacked
         except zmq.error.Again:
             print("Simulation ZMQ Error: Reply from container timed out.")
         except Exception as e:
@@ -707,10 +686,7 @@ class AASVelocityEnv(AASEnv):
         info = self._get_info()
 
         # Handle rendering
-        if self.render_mode == "human" and self.latest_frame is not None:
-            cv2.imshow("YOLO Frame (no boxes)", self.latest_frame)
-            cv2.waitKey(1)
-        elif self.render_mode == "ansi":
+        if self.render_mode == "ansi":
             self._render_frame()
 
         return obs, reward, terminated, truncated, info
@@ -794,9 +770,6 @@ class AASVelocityEnv(AASEnv):
 
     def close(self):
         """Clean up resources."""
-        # Close frame display window
-        cv2.destroyAllWindows()
-
         # Close aircraft ZMQ
         if self.aircraft_socket is not None:
             try:
@@ -1111,11 +1084,8 @@ class AASSimpleCommandEnv(AASVelocityEnv):
             action_payload = struct.pack('d', 0.0)
             self.socket.send(action_payload)
             reply_bytes = self.socket.recv()
-            if len(reply_bytes) >= 8:
-                unpacked = struct.unpack_from('iI', reply_bytes)
-                self.sim_sec, self.sim_nanosec = unpacked
-            else:
-                print(f"Simulation ZMQ Error: Expected 8 bytes, got {len(reply_bytes)}")
+            unpacked = struct.unpack('iI', reply_bytes)
+            self.sim_sec, self.sim_nanosec = unpacked
         except zmq.error.Again:
             print("Simulation ZMQ Error: Timeout")
         except Exception as e:
@@ -1137,10 +1107,7 @@ class AASSimpleCommandEnv(AASVelocityEnv):
         info = self._get_info()
         info['action_name'] = self.last_action_name
 
-        if self.render_mode == "human" and self.latest_frame is not None:
-            cv2.imshow("YOLO Frame (no boxes)", self.latest_frame)
-            cv2.waitKey(1)
-        elif self.render_mode == "ansi":
+        if self.render_mode == "ansi":
             self._render_frame()
 
         return obs, reward, terminated, truncated, info
