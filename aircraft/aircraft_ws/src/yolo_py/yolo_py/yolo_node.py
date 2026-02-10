@@ -68,7 +68,7 @@ class YoloInferenceNode(Node):
         
         # Create publishers
         self.detection_publisher = self.create_publisher(Detection2DArray, 'detections', 10)
-        # self.image_publisher = self.create_publisher(Image, 'detections_image', 10)
+        self.frame_publisher = self.create_publisher(Image, 'yolo_frame', 1)
         self.bridge = CvBridge()
 
         # Pre-allocate reusable arrays for scaling to avoid allocation in hot loops
@@ -173,6 +173,9 @@ class YoloInferenceNode(Node):
             # Publish detections
             if len(boxes) > 0:
                 self.publish_detections(frame.shape, boxes, confidences, class_ids)
+
+            # Publish raw frame (before bounding boxes are drawn)
+            self.frame_publisher.publish(self.bridge.cv2_to_imgmsg(frame, "bgr8"))
 
             # Visualize
             if not self.headless:
@@ -309,9 +312,6 @@ class YoloInferenceNode(Node):
             detection_array.detections.append(detection)
 
         self.detection_publisher.publish(detection_array)
-        
-        # if not self.headless: # TODO: requires to add frame to arguments of publish_detections
-        #     self.image_publisher.publish(self.bridge.cv2_to_imgmsg(frame, "bgr8"))
 
     def visualize(self, frame, boxes, confidences, class_ids):
         for i in range(len(boxes)):

@@ -1,5 +1,6 @@
 import numpy as np
 import gymnasium as gym
+import cv2
 import docker
 import zmq
 import time
@@ -506,6 +507,9 @@ class AASVelocityEnv(AASEnv):
         self.drone_velocity = np.zeros(3)
         self.drone_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion
 
+        # Latest camera frame from YOLO (BGR numpy array, None if unavailable)
+        self.latest_frame = None
+
         # Aircraft ZMQ setup (separate from simulation ZMQ)
         self.aircraft_zmq_port = 5556  # Port for gym_control_node.py
         self.aircraft_socket = None
@@ -526,7 +530,8 @@ class AASVelocityEnv(AASEnv):
             "position": self.drone_position.copy(),
             "velocity": self.drone_velocity.copy(),
             "orientation": self.drone_orientation.copy(),
-            "distance_to_target": np.linalg.norm(self.drone_position - self.target_position)
+            "distance_to_target": np.linalg.norm(self.drone_position - self.target_position),
+            "frame": self.latest_frame,
         }
 
     def _connect_aircraft_zmq(self):
@@ -563,14 +568,26 @@ class AASVelocityEnv(AASEnv):
             action_payload = struct.pack(self.ACTION_FORMAT, vx, vy, vz, yaw_rate)
             self.aircraft_socket.send(action_payload)
 
-            # Receive state
+            # Receive state + optional frame
+            # Format: [10 doubles (80B)] + [uint32 frame_len (4B)] + [frame JPEG bytes]
             reply_bytes = self.aircraft_socket.recv()
 
-            if len(reply_bytes) == self.STATE_SIZE:
-                state = struct.unpack(self.STATE_FORMAT, reply_bytes)
+            if len(reply_bytes) >= self.STATE_SIZE:
+                state = struct.unpack(self.STATE_FORMAT, reply_bytes[:self.STATE_SIZE])
                 self.drone_position = np.array(state[0:3])
                 self.drone_velocity = np.array(state[3:6])
                 self.drone_orientation = np.array(state[6:10])
+
+                # Parse frame if present
+                frame_header_offset = self.STATE_SIZE
+                if len(reply_bytes) >= frame_header_offset + 4:
+                    frame_len = struct.unpack('I', reply_bytes[frame_header_offset:frame_header_offset + 4])[0]
+                    if frame_len > 0:
+                        jpeg_data = reply_bytes[frame_header_offset + 4:frame_header_offset + 4 + frame_len]
+                        self.latest_frame = cv2.imdecode(
+                            np.frombuffer(jpeg_data, dtype=np.uint8), cv2.IMREAD_COLOR
+                        )
+
                 return True
             else:
                 print(f"Warning: Invalid state size received: {len(reply_bytes)}")

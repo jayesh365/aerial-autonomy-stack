@@ -18,6 +18,7 @@ import struct
 import threading
 import time
 
+import cv2
 import numpy as np
 import zmq
 
@@ -30,8 +31,10 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 # Message types for ArduPilot (MAVROS)
 from geometry_msgs.msg import TwistStamped
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Image
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import String
+from cv_bridge import CvBridge
 
 # MAVROS services and messages
 from mavros_msgs.srv import SetMode, CommandBool
@@ -71,6 +74,11 @@ class GymControlNode(Node):
         self.orientation = np.array([1.0, 0.0, 0.0, 0.0])  # quaternion w, x, y, z
         self.state_valid = False
 
+        # Frame storage (JPEG-compressed, thread-safe)
+        self.frame_lock = threading.Lock()
+        self.latest_frame_jpeg = b''  # Empty bytes = no frame available
+        self.bridge = CvBridge()
+
         # Drone state tracking
         self.drone_armed = False
         self.drone_mode = ""
@@ -100,6 +108,19 @@ class GymControlNode(Node):
             self._setup_px4(qos_profile)
         else:
             raise ValueError(f"Unsupported autopilot: {self.autopilot}")
+
+        # Subscribe to raw YOLO frames (published without bounding boxes)
+        self.frame_sub = self.create_subscription(
+            Image,
+            'yolo_frame',
+            self._frame_callback,
+            QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1
+            ),
+            callback_group=self.callback_group
+        )
 
         # Create timer for periodic velocity publishing (needed to maintain GUIDED mode)
         self.last_velocity_cmd = (0.0, 0.0, 0.0, 0.0)
@@ -254,6 +275,16 @@ class GymControlNode(Node):
     def _ardupilot_global_callback(self, msg: NavSatFix):
         """Handle ArduPilot global position (for reference only)."""
         pass  # Can be used for lat/lon if needed
+
+    def _frame_callback(self, msg: Image):
+        """Handle raw YOLO frame (no bounding boxes). JPEG-compress and store."""
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            _, jpeg_data = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            with self.frame_lock:
+                self.latest_frame_jpeg = jpeg_data.tobytes()
+        except Exception as e:
+            self.get_logger().warn(f"Frame conversion error: {e}")
 
     def _px4_local_position_callback(self, msg):
         """Handle PX4 local position (NED frame)."""
@@ -419,14 +450,21 @@ class GymControlNode(Node):
                     # Get current state
                     pos, vel, quat, valid = self.get_state()
 
-                    # Pack and send state
+                    # Get latest frame (JPEG bytes)
+                    with self.frame_lock:
+                        frame_jpeg = self.latest_frame_jpeg
+
+                    # Pack and send state + frame
+                    # Format: [10 doubles (state)] + [uint32 frame_len] + [frame JPEG bytes]
                     state_data = struct.pack(
                         self.STATE_FORMAT,
                         pos[0], pos[1], pos[2],
                         vel[0], vel[1], vel[2],
                         quat[0], quat[1], quat[2], quat[3]
                     )
-                    socket.send(state_data)
+                    frame_len = len(frame_jpeg)
+                    reply = state_data + struct.pack('I', frame_len) + frame_jpeg
+                    socket.send(reply)
 
                 except zmq.ZMQError as e:
                     self.get_logger().error(f"ZMQ error: {e}")
