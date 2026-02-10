@@ -310,13 +310,14 @@ class AASEnv(gym.Env):
             self.socket.send(action_payload) # Send the REQ
             reply_bytes = self.socket.recv() # Wait for the REP (synchronous block) this call will block until a reply is received or it times out
             self.socket.setsockopt(zmq.RCVTIMEO, 60 * 1000) # Restore standard timeout (60s) for stepping
-            unpacked = struct.unpack('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
-            self.sim_sec, self.sim_nanosec = unpacked
-            self.start_sim_sec = float(self.sim_sec) + (float(self.sim_nanosec) * 1e-9)
+            if len(reply_bytes) < 8:
+                print(f"ZMQ Error: Expected 8 bytes, got {len(reply_bytes)}")
+            else:
+                unpacked = struct.unpack_from('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
+                self.sim_sec, self.sim_nanosec = unpacked
+                self.start_sim_sec = float(self.sim_sec) + (float(self.sim_nanosec) * 1e-9)
         except zmq.error.Again:
             print("ZMQ Error: Reply from container timed out.")
-        except ValueError:
-            print("ZMQ Error: Reply format error. Received garbage state.")
         ###########################################################################################
         ###########################################################################################
         ###########################################################################################
@@ -336,13 +337,13 @@ class AASEnv(gym.Env):
             action_payload = struct.pack('d', force) # Serialize the action
             self.socket.send(action_payload) # Send the REQ
             reply_bytes = self.socket.recv() # Wait for the REP (synchronous block) this call will block until a reply is received or it times out
-            unpacked = struct.unpack('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
-            sec, nanosec = unpacked
-            self.sim_sec, self.sim_nanosec = unpacked
+            if len(reply_bytes) >= 8:
+                unpacked = struct.unpack_from('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
+                self.sim_sec, self.sim_nanosec = unpacked
+            else:
+                print(f"ZMQ Error: Expected 8 bytes, got {len(reply_bytes)}")
         except zmq.error.Again:
             print("ZMQ Error: Reply from container timed out.")
-        except ValueError:
-            print("ZMQ Error: Reply format error. Received garbage state.")
         ###########################################################################################
         ###########################################################################################
         ###########################################################################################
@@ -662,8 +663,11 @@ class AASVelocityEnv(AASEnv):
             action_payload = struct.pack('d', 0.0)  # Dummy action for simulation stepping
             self.socket.send(action_payload)
             reply_bytes = self.socket.recv()
-            unpacked = struct.unpack('iI', reply_bytes)
-            self.sim_sec, self.sim_nanosec = unpacked
+            if len(reply_bytes) >= 8:
+                unpacked = struct.unpack_from('iI', reply_bytes)
+                self.sim_sec, self.sim_nanosec = unpacked
+            else:
+                print(f"Simulation ZMQ Error: Expected 8 bytes, got {len(reply_bytes)}")
         except zmq.error.Again:
             print("Simulation ZMQ Error: Reply from container timed out.")
         except Exception as e:
@@ -1084,8 +1088,11 @@ class AASSimpleCommandEnv(AASVelocityEnv):
             action_payload = struct.pack('d', 0.0)
             self.socket.send(action_payload)
             reply_bytes = self.socket.recv()
-            unpacked = struct.unpack('iI', reply_bytes)
-            self.sim_sec, self.sim_nanosec = unpacked
+            if len(reply_bytes) >= 8:
+                unpacked = struct.unpack_from('iI', reply_bytes)
+                self.sim_sec, self.sim_nanosec = unpacked
+            else:
+                print(f"Simulation ZMQ Error: Expected 8 bytes, got {len(reply_bytes)}")
         except zmq.error.Again:
             print("Simulation ZMQ Error: Timeout")
         except Exception as e:
@@ -1229,8 +1236,11 @@ class AASYawEnv(AASSimpleCommandEnv):
             action_payload = struct.pack('d', 0.0)
             self.socket.send(action_payload)
             reply_bytes = self.socket.recv()
-            unpacked = struct.unpack('iI', reply_bytes)
-            self.sim_sec, self.sim_nanosec = unpacked
+            if len(reply_bytes) >= 8:
+                unpacked = struct.unpack_from('iI', reply_bytes)
+                self.sim_sec, self.sim_nanosec = unpacked
+            else:
+                print(f"Simulation ZMQ Error: Expected 8 bytes, got {len(reply_bytes)}")
         except zmq.error.Again:
             print("Simulation ZMQ Error: Timeout")
         except Exception as e:
