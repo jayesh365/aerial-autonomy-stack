@@ -1166,3 +1166,109 @@ class AASSimpleCommandEnv(AASVelocityEnv):
         info['is_flying'] = self.is_flying
         info['takeoff_altitude'] = self.takeoff_altitude
         return info
+
+
+class AASYawEnv(AASSimpleCommandEnv):
+    """
+    Environment with yaw orientation + move/hover control.
+
+    Action Space: [yaw_degrees, move_flag]
+      - yaw_degrees: target heading in degrees (-180 to 180)
+        0 = East, 90 = North, -90 = South, 180 = West (ENU math convention)
+      - move_flag: 0 = hover in place, 1 = move forward at move_velocity in yaw direction
+
+    The drone automatically maintains altitude and rotates to face the target heading.
+
+    Observation Space: [x, y, z, vx, vy, vz, qw, qx, qy, qz]
+    """
+
+    def __init__(self,
+            move_velocity: float = 2.0,
+            takeoff_altitude: float = 40.0,
+            **kwargs,
+        ):
+        kwargs.setdefault('camera', True)
+        super().__init__(
+            move_velocity=move_velocity,
+            takeoff_altitude=takeoff_altitude,
+            **kwargs,
+        )
+
+        # Override action space: [yaw_degrees, move_flag]
+        self.action_space = gym.spaces.Box(
+            low=np.array([-180.0, 0.0], dtype=np.float32),
+            high=np.array([180.0, 1.0], dtype=np.float32),
+        )
+
+    def step(self, action):
+        target_yaw_deg = float(action[0])
+        move_flag = float(action[1]) > 0.5
+
+        target_yaw_rad = np.radians(target_yaw_deg)
+
+        # Velocity in world frame (ENU: x=East, y=North)
+        if move_flag:
+            vx = self.move_velocity * np.cos(target_yaw_rad)
+            vy = self.move_velocity * np.sin(target_yaw_rad)
+        else:
+            vx = 0.0
+            vy = 0.0
+
+        # Altitude hold P-controller
+        altitude_error = self.takeoff_altitude - self.drone_position[2]
+        vz = np.clip(altitude_error * 0.5, -2.0, 2.0)
+
+        # Yaw rate P-controller to rotate toward target heading
+        current_yaw = self._get_current_yaw()
+        yaw_error = target_yaw_rad - current_yaw
+        yaw_error = (yaw_error + np.pi) % (2 * np.pi) - np.pi  # Normalize to [-pi, pi]
+        yaw_rate = np.clip(yaw_error * 1.0, -0.5, 0.5)
+
+        # Step simulation
+        try:
+            action_payload = struct.pack('d', 0.0)
+            self.socket.send(action_payload)
+            reply_bytes = self.socket.recv()
+            unpacked = struct.unpack('iI', reply_bytes)
+            self.sim_sec, self.sim_nanosec = unpacked
+        except zmq.error.Again:
+            print("Simulation ZMQ Error: Timeout")
+        except Exception as e:
+            print(f"Simulation ZMQ Error: {e}")
+
+        # Send velocity command to aircraft
+        self._send_velocity_command(vx, vy, vz, yaw_rate)
+
+        self.step_count += 1
+
+        reward = self._calculate_reward(action)
+        terminated = self._check_terminated()
+        truncated = self.step_count >= self.max_steps
+
+        obs = self._get_obs()
+        info = self._get_info()
+        info['target_yaw_deg'] = target_yaw_deg
+        info['move_flag'] = move_flag
+        info['current_yaw_deg'] = np.degrees(current_yaw)
+
+        if self.render_mode == "ansi":
+            self._render_frame()
+
+        return obs, reward, terminated, truncated, info
+
+    def _get_current_yaw(self):
+        """Extract yaw angle (radians) from quaternion."""
+        qw, qx, qy, qz = self.drone_orientation
+        yaw = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        return yaw
+
+    def _render_frame(self):
+        pos = self.drone_position
+        current_yaw = np.degrees(self._get_current_yaw())
+        move_str = "MOVE" if hasattr(self, '_last_move') else "HOVER"
+        status = (
+            f"\r[{move_str:5s} yaw={current_yaw:6.1f}] "
+            f"Pos: ({pos[0]:7.1f}, {pos[1]:7.1f}, {pos[2]:6.1f}) | "
+            f"Step: {self.step_count}"
+        )
+        print(status, end="", flush=True)
