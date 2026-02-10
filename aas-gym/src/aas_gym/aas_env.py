@@ -703,7 +703,10 @@ class AASVelocityEnv(AASEnv):
         info = self._get_info()
 
         # Handle rendering
-        if self.render_mode == "ansi":
+        if self.render_mode == "human" and self.latest_frame is not None:
+            cv2.imshow("YOLO Frame (no boxes)", self.latest_frame)
+            cv2.waitKey(1)
+        elif self.render_mode == "ansi":
             self._render_frame()
 
         return obs, reward, terminated, truncated, info
@@ -787,6 +790,9 @@ class AASVelocityEnv(AASEnv):
 
     def close(self):
         """Clean up resources."""
+        # Close frame display window
+        cv2.destroyAllWindows()
+
         # Close aircraft ZMQ
         if self.aircraft_socket is not None:
             try:
@@ -1124,7 +1130,10 @@ class AASSimpleCommandEnv(AASVelocityEnv):
         info = self._get_info()
         info['action_name'] = self.last_action_name
 
-        if self.render_mode == "ansi":
+        if self.render_mode == "human" and self.latest_frame is not None:
+            cv2.imshow("YOLO Frame (no boxes)", self.latest_frame)
+            cv2.waitKey(1)
+        elif self.render_mode == "ansi":
             self._render_frame()
 
         return obs, reward, terminated, truncated, info
