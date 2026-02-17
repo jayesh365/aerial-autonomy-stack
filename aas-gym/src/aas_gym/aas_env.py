@@ -7,9 +7,8 @@ import struct
 import os
 import subprocess
 import shutil
-import concurrent.futures
 
-from docker.types import NetworkingConfig, EndpointConfig, DeviceRequest
+from docker.types import DeviceRequest
 
 
 class AASEnv(gym.Env):
@@ -62,9 +61,7 @@ class AASEnv(gym.Env):
         self.WORLD = "impalpable_greyness"
         #
         self.SIM_SUBNET = "10.42"
-        self.AIR_SUBNET = "10.22"
         self.SIM_ID = "100"
-        # self.GROUND_ID = "101" # Unused
         #
         self.GND_CONTAINER = False # Do NOT use the ground-image to run Zenoh (nor QGC)
         self.RTF = 15.0 # Note: RTFs > 10 can destabilize PX4/ArduPilot SITL
@@ -73,13 +70,9 @@ class AASEnv(gym.Env):
         #
         sim_parts = self.SIM_SUBNET.split('.')
         self.SIM_SUBNET = f"{sim_parts[0]}.{int(sim_parts[1]) + self.INSTANCE}"
-        # air_parts = self.AIR_SUBNET.split('.') # Unused
-        # self.AIR_SUBNET = f"{air_parts[0]}.{int(air_parts[1]) + self.INSTANCE}" # Unused
         #
         self.SIM_NET_NAME = f"aas-sim-network-inst{self.INSTANCE}"
-        # self.AIR_NET_NAME = f"aas-air-network-inst{self.INSTANCE}" # Unused
-        self.SIM_CONT_NAME = f"simulation-container-inst{self.INSTANCE}"
-        # self.GND_CONT_NAME = f"ground-container-inst{self.INSTANCE}" # Unused
+        self.GYM_CONT_NAME = f"gym-container-inst{self.INSTANCE}"
 
         # X Server access (this is redundancy for configure_host_x11() in gym_run.py)
         if shutil.which("xhost"):
@@ -111,7 +104,6 @@ class AASEnv(gym.Env):
         #
         networks_config = [
             {"name": self.SIM_NET_NAME, "subnet_base": self.SIM_SUBNET},
-            # {"name": self.AIR_NET_NAME, "subnet_base": self.AIR_SUBNET} # Unused
         ]
         self.networks = {}
         for net_config in networks_config:
@@ -154,11 +146,11 @@ class AASEnv(gym.Env):
         }
         device_binds = ['/dev/dri:/dev/dri:rwm'] # Replaces "--device /dev/dri"
         #
-        force_container_cleanup(self.SIM_CONT_NAME)
-        print(f"Creating Simulation Container ({self.SIM_CONT_NAME})...")
-        self.simulation_container = self.client.containers.create(
-            "simulation-image:latest",
-            name=self.SIM_CONT_NAME,
+        force_container_cleanup(self.GYM_CONT_NAME)
+        print(f"Creating Gym Container ({self.GYM_CONT_NAME})...")
+        self.gym_container = self.client.containers.create(
+            "gym-image:latest",
+            name=self.GYM_CONT_NAME,
             tty=True, # Replaces -it
             detach=True,
             auto_remove=False,
@@ -183,7 +175,6 @@ class AASEnv(gym.Env):
                 "RTF": str(self.RTF),
                 "START_AS_PAUSED": str(self.START_AS_PAUSED).lower(),
                 "SIM_SUBNET": self.SIM_SUBNET,
-                # "GROUND_ID": self.GROUND_ID,
                 "GND_CONTAINER": str(self.GND_CONTAINER).lower(),
                 "ROS_DOMAIN_ID": self.SIM_ID,
                 "GYMNASIUM" : "true",
@@ -192,69 +183,12 @@ class AASEnv(gym.Env):
                 "INSTANCE": str(self.INSTANCE),
             }
         )
-        print(f"Connecting {self.SIM_CONT_NAME} to {self.SIM_NET_NAME}...")
+        print(f"Connecting {self.GYM_CONT_NAME} to {self.SIM_NET_NAME}...")
         self.networks[self.SIM_NET_NAME].connect(
-            self.simulation_container,
+            self.gym_container,
             ipv4_address=f"{self.SIM_SUBNET}.90.{self.SIM_ID}"
         )
-        # print(f"Connecting {self.SIM_CONT_NAME} to {self.AIR_NET_NAME}...")
-        # self.networks[self.AIR_NET_NAME].connect(
-        #     self.simulation_container,
-        #     ipv4_address=f"{self.AIR_SUBNET}.90.{self.SIM_ID}"
-        # )
-        # self.simulation_container.start()
-        #
-        self.aircraft_containers = []
-        for i in range(1, self.NUM_QUADS + self.NUM_VTOLS + 1):            
-            air_cont_name = f"aircraft-container-inst{self.INSTANCE}_{i}"
-            force_container_cleanup(air_cont_name)
-            print(f"Creating Aircraft Container {air_cont_name}...")
-            drone_type = "quad" if i <= self.NUM_QUADS else "vtol"
-            air_cont = self.client.containers.create(
-                "aircraft-image:latest",
-                name=air_cont_name,
-                tty=True, # Replaces -it
-                detach=True,
-                auto_remove=False,
-                privileged=True, # Replaces --privileged
-                volumes=volume_binds,
-                devices=device_binds,
-                device_requests=gpu_requests,
-                environment={
-                    "DISPLAY": env_display,
-                    "QT_X11_NO_MITSHM": "1",
-                    "NVIDIA_DRIVER_CAPABILITIES": "all",
-                    "XDG_RUNTIME_DIR": env_xdg,
-                    "GST_DEBUG": "3",
-                    "AUTOPILOT": self.AUTOPILOT,
-                    "HEADLESS": str(self.HEADLESS).lower(),
-                    "CAMERA": str(self.CAMERA).lower(),
-                    "LIDAR": str(self.LIDAR).lower(),
-                    "DRONE_TYPE": drone_type,
-                    "DRONE_ID": str(i),
-                    "SIMULATED_TIME": "true",
-                    "SIM_SUBNET": self.SIM_SUBNET,
-                    # "AIR_SUBNET": self.AIR_SUBNET,
-                    "SIM_ID": self.SIM_ID,
-                    # "GROUND_ID": self.GROUND_ID,
-                    "GND_CONTAINER": str(self.GND_CONTAINER).lower(),
-                    "ROS_DOMAIN_ID": str(i),
-                    "GYMNASIUM" : "true",
-                }
-            )
-            print(f"Connecting {air_cont_name} to {self.SIM_NET_NAME}...")
-            self.networks[self.SIM_NET_NAME].connect(
-                air_cont,
-                ipv4_address=f"{self.SIM_SUBNET}.90.{i}"
-            )
-            # print(f"Connecting {air_cont_name} to {self.AIR_NET_NAME}...")
-            # self.networks[self.AIR_NET_NAME].connect(
-            #     air_cont,
-            #     ipv4_address=f"{self.AIR_SUBNET}.90.{i}"
-            # )
-            # air_cont.start()
-            self.aircraft_containers.append(air_cont)
-        print("Docker setup complete. All containers are running and connected.")
+        print("Docker setup complete. Gym container created and connected.")
 
         # ZeroMQ setup
         self.zmq_context = zmq.Context()
@@ -276,17 +210,12 @@ class AASEnv(gym.Env):
         # Close existing ZMQ connection if any
         if self.socket:
             self.socket.close()
-        # Restart Docker containers
+        # Restart the gym container
         try:
-            print("Restarting all containers in parallel...")
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = [executor.submit(self.simulation_container.restart)]
-                for air_cont in self.aircraft_containers:
-                    futures.append(executor.submit(air_cont.restart))
-                for future in concurrent.futures.as_completed(futures):
-                    future.result()
+            print("Restarting gym container...")
+            self.gym_container.restart()
         except Exception as e:
-            print(f"Error restarting containers: {e}")
+            print(f"Error restarting container: {e}")
             raise e
         # Establish ZeroMQ connection
         self.socket = self.zmq_context.socket(zmq.REQ)
@@ -382,18 +311,11 @@ class AASEnv(gym.Env):
             print() # Add a newline after the final render
         
         try:
-            self.simulation_container.stop()
-            self.simulation_container.remove(force=True)
-            print(f"Simulation container '{self.simulation_container.name}' stopped.")
+            self.gym_container.stop()
+            self.gym_container.remove(force=True)
+            print(f"Gym container '{self.gym_container.name}' stopped.")
         except Exception:
             pass
-        for container in self.aircraft_containers:
-            try:
-                container.stop()
-                container.remove(force=True)
-                print(f"Aircraft container '{container.name}' stopped.")
-            except Exception:
-                pass
         for net_name, network_obj in self.networks.items():
             try:
                 network_obj.remove()
@@ -416,9 +338,9 @@ class AASVelocityEnv(AASEnv):
     - Action Space: Velocity commands [vx, vy, vz, yaw_rate] in m/s and rad/s
     - Observation Space: Drone state [x, y, z, vx, vy, vz, qw, qx, qy, qz]
 
-    The environment communicates with:
-    1. Simulation container (via ZMQ) for world stepping
-    2. Aircraft container (via ZMQ) for velocity control and state feedback
+    The environment communicates with a single gym container (via ZMQ):
+    1. Simulation ZMQ bridge (port 5555) for world stepping
+    2. Aircraft control ZMQ (port 5556) for velocity control and state feedback
 
     Coordinate Frame:
     - ArduPilot: ENU (East-North-Up) - vx=East, vy=North, vz=Up
@@ -530,7 +452,7 @@ class AASVelocityEnv(AASEnv):
         }
 
     def _connect_aircraft_zmq(self):
-        """Connect to aircraft container ZMQ socket."""
+        """Connect to aircraft ZMQ socket (same container as simulation)."""
         if self.aircraft_socket is not None:
             try:
                 self.aircraft_socket.close()
@@ -541,9 +463,8 @@ class AASVelocityEnv(AASEnv):
         self.aircraft_socket.setsockopt(zmq.RCVTIMEO, 10 * 1000)  # 10 second timeout
         self.aircraft_socket.setsockopt(zmq.SNDTIMEO, 10 * 1000)
 
-        # Connect to first aircraft container
-        # Aircraft IP is at SIM_SUBNET.90.1 (drone ID 1)
-        aircraft_ip = f"{self.SIM_SUBNET}.90.1"
+        # Both simulation and aircraft ZMQ run in the same gym container
+        aircraft_ip = f"{self.SIM_SUBNET}.90.{self.SIM_ID}"
         self.aircraft_socket.connect(f"tcp://{aircraft_ip}:{self.aircraft_zmq_port}")
         print(f"Aircraft ZMQ socket connected to {aircraft_ip}:{self.aircraft_zmq_port}")
 
@@ -608,7 +529,7 @@ class AASVelocityEnv(AASEnv):
         self.aircraft_socket.setsockopt(zmq.SNDTIMEO, 10 * 1000)
         self.aircraft_socket.setsockopt(zmq.LINGER, 0)
 
-        aircraft_ip = f"{self.SIM_SUBNET}.90.1"
+        aircraft_ip = f"{self.SIM_SUBNET}.90.{self.SIM_ID}"
         self.aircraft_socket.connect(f"tcp://{aircraft_ip}:{self.aircraft_zmq_port}")
         print(f"Aircraft ZMQ socket reconnected to {aircraft_ip}:{self.aircraft_zmq_port}")
 

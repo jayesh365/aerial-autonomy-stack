@@ -8,7 +8,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 if [ "${CLEAN_BUILD:-false}" = "true" ]; then
   rm -rf "${SCRIPT_DIR}/../github_clones"
-  docker rmi aircraft-image:latest ground-image:latest simulation-image:latest || true
+  docker rmi aircraft-image:latest ground-image:latest simulation-image:latest gym-image:latest || true
   docker builder prune -f # If CLEAN_BUILD is "true", rebuild everything from scratch
 fi
 
@@ -69,6 +69,10 @@ if [ "$BUILD_DOCKER" = "true" ]; then
 
   # The first build takes ~10' and creates an 18GB image (8GB for ros-humble-desktop with nvidia runtime, 7GB for YOLOv8, ONNX)
   docker build -t aircraft-image -f "${SCRIPT_DIR}/docker/Dockerfile.aircraft" "${SCRIPT_DIR}/.."
+
+  # The gym image extends the simulation image with aircraft components (MAVROS, XRCE-DDS, aircraft workspace)
+  # Requires simulation-image to be built first
+  docker build -t gym-image -f "${SCRIPT_DIR}/docker/Dockerfile.gym" "${SCRIPT_DIR}/.."
 else
   echo -e "Skipping Docker builds"
 fi
